@@ -2,69 +2,57 @@ package observer
 
 import (
 	"strings"
-	"sync"
 	"testing"
 	"time"
-
-	"github.com/chenhg5/cc-connect/core"
 )
 
-type jobRecorder struct {
-	mu   sync.Mutex
-	jobs []*core.CronJob
+func msg(session, sender, content string, mentioned bool) IncomingMessage {
+	return IncomingMessage{SessionKey: session, UserName: sender, Content: content, Mentioned: mentioned}
 }
 
-func (r *jobRecorder) add(j *core.CronJob) {
-	r.mu.Lock()
-	r.jobs = append(r.jobs, j)
-	r.mu.Unlock()
+func newTestObserver(cfg Config) *Observer {
+	cfg.WindowSec = 0 // tests opt into the engage window explicitly
+	return New(cfg)
 }
 
-func (r *jobRecorder) count() int {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	return len(r.jobs)
-}
-
-func (r *jobRecorder) last() *core.CronJob {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if len(r.jobs) == 0 {
-		return nil
+func TestAtMessageAlwaysForwardsWithHighEffort(t *testing.T) {
+	o := newTestObserver(defaultConfig())
+	d := o.Decide(msg("qq:g:1", "A", "推荐几个好玩的游戏", true))
+	if !d.Forward || d.Content != "推荐几个好玩的游戏" || d.Effort != "high" || d.SuppressProgress {
+		t.Fatalf("at decision wrong: %+v", d)
 	}
-	return r.jobs[len(r.jobs)-1]
 }
 
-func newTestObserver(cfg Config) (*Observer, *jobRecorder) {
-	o := New(nil, cfg)
-	rec := &jobRecorder{}
-	o.SetRunner(func(j *core.CronJob) error {
-		rec.add(j)
-		return nil
-	})
-	return o, rec
-}
-
-func TestKeywordActivation(t *testing.T) {
+func TestKeywordActivationForwardsShadow(t *testing.T) {
 	cfg := defaultConfig()
 	cfg.CooldownSec = 0
 	cfg.MinIntervalSec = 0
 	cfg.MaxPerHour = 100
-	o, rec := newTestObserver(cfg)
+	o := newTestObserver(cfg)
 
-	o.OnGroupMessage(&core.Message{SessionKey: "qq:g:1", UserName: "A", Content: "今天为什么不下雨"})
-	o.OnGroupMessage(&core.Message{SessionKey: "qq:g:1", UserName: "B", Content: "今天天气不错"})
-	time.Sleep(80 * time.Millisecond)
+	d := o.Decide(msg("qq:g:1", "A", "你觉得什么游戏好玩", false))
+	if !d.Forward {
+		t.Fatal("keyword message should forward as shadow turn")
+	}
+	if d.Effort != "low" || !d.SuppressProgress {
+		t.Fatalf("shadow decision should use low effort + suppress progress: %+v", d)
+	}
+	for _, want := range []string{"影子人格", "本次触发", "NO_REPLY", "最值得回复", "不透露存在"} {
+		if !strings.Contains(d.Content, want) {
+			t.Fatalf("shadow prompt missing %q", want)
+		}
+	}
+}
 
-	if n := rec.count(); n != 1 {
-		t.Fatalf("keyword activation: got %d observation turns, want 1", n)
-	}
-	job := rec.last()
-	if !strings.Contains(job.Prompt, "NO_REPLY") || !strings.Contains(job.Prompt, "群聊记录") {
-		t.Fatalf("observation prompt missing liveliness/NO_REPLY instructions: %q", job.Prompt)
-	}
-	if job.SessionKey != "qq:g:1" || job.SessionMode != "new_per_run" || !job.SuppressProgress || job.Silent == nil || !*job.Silent {
-		t.Fatalf("observation job fields wrong: %+v", job)
+func TestNoKeywordNoForward(t *testing.T) {
+	cfg := defaultConfig()
+	cfg.CooldownSec = 0
+	cfg.MinIntervalSec = 0
+	cfg.MaxPerHour = 100
+	o := newTestObserver(cfg)
+
+	if d := o.Decide(msg("qq:g:1", "A", "今天天气不错", false)); d.Forward {
+		t.Fatal("non-keyword message should not forward outside engage window")
 	}
 }
 
@@ -73,108 +61,285 @@ func TestIgnorePatternsExcludeMessages(t *testing.T) {
 	cfg.CooldownSec = 0
 	cfg.MinIntervalSec = 0
 	cfg.MaxPerHour = 100
-	o, rec := newTestObserver(cfg)
+	o := newTestObserver(cfg)
 	o.SetIgnorePatterns([]string{`^#`, `^\*`})
 
-	o.OnGroupMessage(&core.Message{SessionKey: "qq:g:1", UserName: "A", Content: "#为什么更新不了"})
-	o.OnGroupMessage(&core.Message{SessionKey: "qq:g:1", UserName: "A", Content: "为什么更新不了"})
-	time.Sleep(80 * time.Millisecond)
-
-	if n := rec.count(); n != 1 {
-		t.Fatalf("ignore patterns: got %d turns, want 1 (only non-ignored activates)", n)
+	if d := o.Decide(msg("qq:g:1", "A", "#为什么更新不了", false)); d.Forward {
+		t.Fatal("ignored message should not forward")
+	}
+	if d := o.Decide(msg("qq:g:1", "A", "为什么更新不了", false)); !d.Forward {
+		t.Fatal("non-ignored keyword message should forward")
 	}
 }
 
-func TestCooldownBlocksRepeatedActivation(t *testing.T) {
-	cfg := defaultConfig()
-	cfg.CooldownSec = 3600
-	cfg.MinIntervalSec = 0
-	cfg.MaxPerHour = 100
-	o, rec := newTestObserver(cfg)
-
-	o.OnGroupMessage(&core.Message{SessionKey: "qq:g:1", UserName: "A", Content: "为什么不下雨"})
-	o.OnGroupMessage(&core.Message{SessionKey: "qq:g:1", UserName: "B", Content: "这个为什么这样"})
-	time.Sleep(80 * time.Millisecond)
-
-	if n := rec.count(); n != 1 {
-		t.Fatalf("cooldown: got %d turns, want 1", n)
-	}
-}
-
-func TestMentionRecordedAndAnnotated(t *testing.T) {
+func TestMultiUserRuleActivates(t *testing.T) {
 	cfg := defaultConfig()
 	cfg.CooldownSec = 0
 	cfg.MinIntervalSec = 0
 	cfg.MaxPerHour = 100
-	o, rec := newTestObserver(cfg)
+	cfg.Rules = []Rule{{Type: "multi_user", MinUsers: 4, WindowSec: 300}}
+	o := newTestObserver(cfg)
 
-	o.OnGroupMessage(&core.Message{SessionKey: "qq:g:1", UserName: "A", Content: "在吗", Mentioned: true})
-	o.OnGroupMessage(&core.Message{SessionKey: "qq:g:1", UserName: "B", Content: "你们觉得呢"})
-	time.Sleep(80 * time.Millisecond)
-
-	if n := rec.count(); n != 1 {
-		t.Fatalf("expected 1 observation turn, got %d", n)
+	// Three distinct participants: not enough.
+	o.Decide(msg("qq:g:1", "A", "今天天气不错", false))
+	o.Decide(msg("qq:g:1", "B", "是啊挺热的", false))
+	o.Decide(msg("qq:g:1", "C", "晚上还凉快", false))
+	if d := o.Decide(msg("qq:g:1", "C", "还是C", false)); d.Forward {
+		t.Fatal("3 distinct participants should not activate multi_user(min=4)")
 	}
-	if p := rec.last().Prompt; !strings.Contains(p, "@回复") {
-		t.Fatalf("prompt should annotate recent @ reply times: %q", p)
+
+	// A fourth distinct participant crosses the threshold.
+	if d := o.Decide(msg("qq:g:1", "D", "明天降温", false)); !d.Forward {
+		t.Fatal("4 distinct participants should activate multi_user(min=4)")
 	}
 }
 
-func TestBufferCapAndContext(t *testing.T) {
+func TestEngageWindowForwardsWithoutKeyword(t *testing.T) {
 	cfg := defaultConfig()
-	cfg.BufferSize = 2
-	o, _ := newTestObserver(cfg)
+	cfg.WindowSec = 600
+	cfg.CooldownSec = 0
+	cfg.MinIntervalSec = 0
+	cfg.MaxPerHour = 100
+	o := New(cfg)
+	o.OnGroupReply("qq:g:1")
 
-	for i := 0; i < 3; i++ {
-		o.OnGroupMessage(&core.Message{SessionKey: "qq:g:1", UserName: "A", Content: "消息"})
+	if d := o.Decide(msg("qq:g:1", "A", "今天天气不错", false)); !d.Forward {
+		t.Fatal("engage window should forward without keyword")
 	}
+}
+
+func TestEngageWindowExpiresWithoutKeyword(t *testing.T) {
+	cfg := defaultConfig()
+	cfg.WindowSec = 600
+	cfg.CooldownSec = 0
+	cfg.MinIntervalSec = 0
+	cfg.MaxPerHour = 100
+	o := New(cfg)
+
 	o.mu.Lock()
-	st := o.groups["qq:g:1"]
+	st := &groupState{}
+	st.replies = []replyEvent{{At: time.Now().Add(-20 * time.Minute), Kind: "proactive"}}
+	o.groups["qq:g:1"] = st
 	o.mu.Unlock()
-	if st == nil || len(st.buf) != 2 {
-		t.Fatalf("buffer cap: got %d buffered, want 2", len(st.buf))
-	}
-	if got := o.contextMsgs(st); len(got) != 2 {
-		t.Fatalf("context msgs: got %d, want 2", len(got))
+
+	if d := o.Decide(msg("qq:g:1", "A", "今天天气不错", false)); d.Forward {
+		t.Fatal("outside engage window without keyword should not forward")
 	}
 }
 
-func TestMaxPerHourBlocks(t *testing.T) {
+func TestCatchUpSupplementsMissedMessages(t *testing.T) {
 	cfg := defaultConfig()
 	cfg.CooldownSec = 0
 	cfg.MinIntervalSec = 0
-	cfg.MaxPerHour = 1
-	o, _ := newTestObserver(cfg)
+	cfg.MaxPerHour = 100
+	o := newTestObserver(cfg)
 
-	st := &groupState{}
-	now := time.Now()
-	st.replies = []replyEvent{
-		{At: now.Add(-10 * time.Minute), Kind: "proactive"},
+	// M1 @ -> forwarded, sets the forwarding point.
+	d1 := o.Decide(msg("qq:g:1", "A", "M1at消息", true))
+	if !d1.Forward {
+		t.Fatal("M1 should forward")
 	}
+	// M2/M3 missed (no keyword).
+	if o.Decide(msg("qq:g:1", "B", "M2闲聊内容", false)).Forward {
+		t.Fatal("M2 should not forward")
+	}
+	if o.Decide(msg("qq:g:1", "C", "M3闲聊内容", false)).Forward {
+		t.Fatal("M3 should not forward")
+	}
+	// M4 triggers shadow: prompt must include M2/M3, not M1.
+	d4 := o.Decide(msg("qq:g:1", "D", "你们怎么看待这个", false))
+	if !d4.Forward {
+		t.Fatal("M4 should forward")
+	}
+	for _, want := range []string{"M2闲聊内容", "M3闲聊内容", "你们怎么看待这个"} {
+		if !strings.Contains(d4.Content, want) {
+			t.Fatalf("shadow prompt missing %q", want)
+		}
+	}
+	if strings.Contains(d4.Content, "M1at消息") {
+		t.Fatal("already-forwarded M1 should not be re-supplemented")
+	}
+}
+
+func TestCatchUpWindowExcludesOldMessages(t *testing.T) {
+	cfg := defaultConfig()
+	cfg.CooldownSec = 0
+	cfg.MinIntervalSec = 0
+	cfg.MaxPerHour = 100
+	cfg.WindowSec = 600
+	o := New(cfg)
+	now := time.Now()
+	st := &groupState{lastForwardedAt: now.Add(-3 * time.Hour)}
+	st.buf = append(st.buf, ObservedMessage{At: now.Add(-2 * time.Hour), Sender: "X", Text: "很旧的消息"})
 	o.mu.Lock()
 	o.groups["qq:g:1"] = st
 	o.mu.Unlock()
 
-	o.OnGroupMessage(&core.Message{SessionKey: "qq:g:1", UserName: "A", Content: "为什么"})
-	time.Sleep(80 * time.Millisecond)
-	if !st.lastAct.IsZero() {
-		t.Fatal("max_per_hour should block activation when hourly limit reached")
+	d := o.Decide(msg("qq:g:1", "D", "你们怎么看", false))
+	if d.Forward && strings.Contains(d.Content, "很旧的消息") {
+		t.Fatal("old message outside catchup window should be excluded")
 	}
 }
 
-func TestProactiveEventRecordedAfterRun(t *testing.T) {
+func TestOnGroupReplyRecordsProactive(t *testing.T) {
 	cfg := defaultConfig()
+	cfg.WindowSec = 600
 	cfg.CooldownSec = 0
 	cfg.MinIntervalSec = 0
 	cfg.MaxPerHour = 100
-	o, _ := newTestObserver(cfg)
+	o := New(cfg)
 
-	o.OnGroupMessage(&core.Message{SessionKey: "qq:g:1", UserName: "A", Content: "为什么"})
-	time.Sleep(80 * time.Millisecond)
+	// A reply before any observation is ignored; after one Decide the group exists.
+	o.Decide(msg("qq:g:1", "A", "为什么", false))
+	o.OnGroupReply("qq:g:1")
+
 	o.mu.Lock()
 	st := o.groups["qq:g:1"]
 	o.mu.Unlock()
 	if st == nil || lastProactive(st).IsZero() {
-		t.Fatal("proactive reply event should be recorded after an observation run")
+		t.Fatal("OnGroupReply should record a proactive reply")
+	}
+}
+
+func TestMentionedRecordsAtReply(t *testing.T) {
+	o := newTestObserver(defaultConfig())
+	o.Decide(msg("qq:g:1", "A", "在吗", true))
+	o.mu.Lock()
+	st := o.groups["qq:g:1"]
+	o.mu.Unlock()
+	if st == nil || len(st.replies) != 1 || st.replies[0].Kind != "at" {
+		t.Fatalf("at event not recorded: %+v", st)
+	}
+}
+
+func TestNonAtPendingWhenBusy(t *testing.T) {
+	cfg := defaultConfig()
+	cfg.CooldownSec = 0
+	cfg.MinIntervalSec = 0
+	cfg.MaxPerHour = 100
+	o := New(cfg)
+	o.SetSessionBusy(func(string) bool { return true })
+
+	d := o.Decide(msg("qq:g:1", "A", "你们觉得什么好玩", false))
+	if !d.Pending || d.Forward {
+		t.Fatalf("busy non-@ message should pend: %+v", d)
+	}
+}
+
+func TestAtNotPendingWhenBusy(t *testing.T) {
+	cfg := defaultConfig()
+	o := New(cfg)
+	o.SetSessionBusy(func(string) bool { return true })
+
+	d := o.Decide(msg("qq:g:1", "A", "推荐个游戏", true))
+	if d.Pending || !d.Forward {
+		t.Fatalf("@ message should decide immediately even when busy: %+v", d)
+	}
+}
+
+func TestPendingDecidedAfterReply(t *testing.T) {
+	cfg := defaultConfig()
+	cfg.CooldownSec = 0
+	cfg.MinIntervalSec = 0
+	cfg.MaxPerHour = 100
+	o := New(cfg)
+	busy := true
+	o.SetSessionBusy(func(string) bool { return busy })
+	var forwarded []Decision
+	o.SetForwarder(func(_ string, d Decision) error {
+		forwarded = append(forwarded, d)
+		return nil
+	})
+
+	if d := o.Decide(msg("qq:g:1", "A", "你们觉得什么好玩", false)); !d.Pending {
+		t.Fatalf("should pend while busy: %+v", d)
+	}
+
+	// The in-flight turn completes with a real reply -> pending re-decided.
+	busy = false
+	o.OnGroupReply("qq:g:1")
+	if len(forwarded) != 1 || !forwarded[0].Forward || forwarded[0].Effort != "low" {
+		t.Fatalf("pending should be forwarded after reply: %v", forwarded)
+	}
+}
+
+func TestPendingStaleDropped(t *testing.T) {
+	cfg := defaultConfig()
+	cfg.CooldownSec = 0
+	cfg.MinIntervalSec = 0
+	cfg.MaxPerHour = 100
+	cfg.WindowSec = 600
+	o := New(cfg)
+	busy := true
+	o.SetSessionBusy(func(string) bool { return busy })
+	var forwarded []Decision
+	o.SetForwarder(func(_ string, d Decision) error {
+		forwarded = append(forwarded, d)
+		return nil
+	})
+
+	if d := o.Decide(msg("qq:g:1", "A", "你们觉得什么好玩", false)); !d.Pending {
+		t.Fatal("should pend while busy")
+	}
+	// Age the pending message beyond the catchup window.
+	o.mu.Lock()
+	st := o.groups["qq:g:1"]
+	st.pending[0].entry.At = time.Now().Add(-2 * time.Hour)
+	o.mu.Unlock()
+
+	busy = false
+	o.OnGroupReply("qq:g:1")
+	if len(forwarded) != 0 {
+		t.Fatalf("stale pending message should be dropped, got %d forwards", len(forwarded))
+	}
+}
+
+func TestPendingOnlyFirstForwardedRestWaits(t *testing.T) {
+	cfg := defaultConfig()
+	cfg.CooldownSec = 0
+	cfg.MinIntervalSec = 0
+	cfg.MaxPerHour = 100
+	o := New(cfg)
+	busy := true
+	o.SetSessionBusy(func(string) bool { return busy })
+	var forwarded []Decision
+	o.SetForwarder(func(_ string, d Decision) error {
+		forwarded = append(forwarded, d)
+		return nil
+	})
+
+	o.Decide(msg("qq:g:1", "A", "你们觉得什么好玩", false))
+	o.Decide(msg("qq:g:1", "B", "这是第二个话题，你们怎么看", false))
+
+	busy = false
+	o.OnGroupReply("qq:g:1")
+	if len(forwarded) != 1 {
+		t.Fatalf("only the first pending should forward, got %d", len(forwarded))
+	}
+	o.mu.Lock()
+	st := o.groups["qq:g:1"]
+	remaining := len(st.pending)
+	o.mu.Unlock()
+	if remaining != 1 {
+		t.Fatalf("second pending should stay queued, remaining=%d", remaining)
+	}
+}
+
+func TestCatchUpCharCap(t *testing.T) {
+	cfg := defaultConfig()
+	cfg.CooldownSec = 0
+	cfg.MinIntervalSec = 0
+	cfg.MaxPerHour = 100
+	cfg.CatchupMaxChars = 10
+	o := newTestObserver(cfg)
+
+	o.Decide(msg("qq:g:1", "A", "M1at消息", true))
+	o.Decide(msg("qq:g:1", "B", "很长很长的闲聊内容AAAAAAAAAA", false))
+	d := o.Decide(msg("qq:g:1", "C", "你们怎么看", false))
+	if !d.Forward {
+		t.Fatal("should forward")
+	}
+	if strings.Contains(d.Content, "很长很长的闲聊内容") {
+		t.Fatal("catchup text beyond char cap should be dropped")
 	}
 }
