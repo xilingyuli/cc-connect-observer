@@ -1,0 +1,20 @@
+# 群聊观察者插件配置（部署位置：<data_dir>/observer.toml，如 ~/.cc-connect/observer.toml）
+# 总开关在 cc-connect 的 config.toml 顶层：observer = true
+
+# 每群滚动观察缓冲大小（条）
+buffer_size = 50
+# 激活时最多给模型看的最近消息条数
+max_context_msgs = 30
+# 激活后冷却秒数（避免连环激活）
+cooldown_sec = 600
+# 两次主动插话的最小间隔秒数
+min_interval_sec = 900
+# 主动插话每小时上限
+max_per_hour = 3
+# 提示词中标注的最近发言/触发记录条数
+recent_replies_for_prompt = 10
+
+# 激活规则列表（v1 实现 keyword，后续可扩展 burst / multi_user / random）
+[[rules]]
+type = "keyword"
+regex = ["为什么", "怎么回事", "你们觉得", "有没有"]

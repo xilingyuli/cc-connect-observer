@@ -1,0 +1,12 @@
+# 群聊观察者插件配置（cc-connect 总开关：config.toml 顶层 observer = true）
+
+buffer_size = 50
+max_context_msgs = 30
+cooldown_sec = 600
+min_interval_sec = 900
+max_per_hour = 3
+recent_replies_for_prompt = 10
+
+[[rules]]
+type = "keyword"
+regex = ["为什么", "怎么回事", "你们觉得", "有没有"]
