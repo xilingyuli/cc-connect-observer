@@ -1,4 +1,4 @@
-# 群聊影子人格插件配置（observer，cc-connect 总开关：config.toml 顶层 observer = 本文件路径）
+# 群聊被动参与插件配置（observer，cc-connect 总开关：config.toml 顶层 observer = 本文件路径）
 
 # 每群滚动观察缓冲大小（条）
 buffer_size = 50
@@ -17,14 +17,16 @@ reply_rate = 20
 # 统一时间窗口（秒）：补转交过滤 / pending 超时即弃 / 真实回复后持续投递共用
 window_sec = 600
 
-# @ 触发（主会话）的推理强度
-at_effort = "high"
-# 影子人格主动回话的推理强度
-shadow_effort = "low"
-# 影子回合隐藏思考/进度消息（true）
-suppress_shadow_progress = true
-# 影子人格对外使用的名字（留空则用“本群机器人”）
+# @ 或叫昵称（直接对话）的推理强度
+at_effort = "medium"
+# 主动插话回合的推理强度
+proactive_effort = "low"
+# 群聊回合一律隐藏思考/进度消息（true）
+suppress_group_progress = true
+# 对外使用的名字（留空则用“本群机器人”）
 persona_name = "鱼璃"
+# 别称/昵称（人设中会说明；别人明确这样叫即视为直接对话）
+persona_alias = "小鲸鱼"
 
 # 补转交：补上次真实转交点到本次触发之间未转交的最近文本消息
 catchup_max_msgs = 100

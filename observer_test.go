@@ -15,15 +15,23 @@ func newTestObserver(cfg Config) *Observer {
 	return New(cfg)
 }
 
-func TestAtMessageAlwaysForwardsWithHighEffort(t *testing.T) {
+func TestAtMessageForwardsDirectWithMediumEffort(t *testing.T) {
 	o := newTestObserver(defaultConfig())
 	d := o.Decide(msg("qq:g:1", "A", "推荐几个好玩的游戏", true))
-	if !d.Forward || d.Content != "推荐几个好玩的游戏" || d.Effort != "high" || d.SuppressProgress {
+	if !d.Forward || d.Effort != "medium" || !d.SuppressProgress {
 		t.Fatalf("at decision wrong: %+v", d)
+	}
+	for _, want := range []string{"你的身份", "被 @ 的直接对话", "积极回应"} {
+		if !strings.Contains(d.Content, want) {
+			t.Fatalf("direct prompt missing %q", want)
+		}
+	}
+	if strings.Contains(d.Content, "最值得回复的前") {
+		t.Fatal("direct turn should not carry the top-X% judgment")
 	}
 }
 
-func TestKeywordActivationForwardsShadow(t *testing.T) {
+func TestKeywordActivationForwardsProactive(t *testing.T) {
 	cfg := defaultConfig()
 	cfg.CooldownSec = 0
 	cfg.MinIntervalSec = 0
@@ -32,15 +40,48 @@ func TestKeywordActivationForwardsShadow(t *testing.T) {
 
 	d := o.Decide(msg("qq:g:1", "A", "你觉得什么游戏好玩", false))
 	if !d.Forward {
-		t.Fatal("keyword message should forward as shadow turn")
+		t.Fatal("keyword message should forward as proactive turn")
 	}
 	if d.Effort != "low" || !d.SuppressProgress {
-		t.Fatalf("shadow decision should use low effort + suppress progress: %+v", d)
+		t.Fatalf("proactive decision should use low effort + suppress progress: %+v", d)
 	}
-	for _, want := range []string{"影子人格", "本次触发", "NO_REPLY", "最值得回复", "不透露存在"} {
+	for _, want := range []string{"你的身份", "本次触发", "NO_REPLY", "最值得回复的前 20%"} {
 		if !strings.Contains(d.Content, want) {
-			t.Fatalf("shadow prompt missing %q", want)
+			t.Fatalf("proactive prompt missing %q", want)
 		}
+	}
+}
+
+func TestAliasMentionForwardsDirect(t *testing.T) {
+	cfg := defaultConfig()
+	cfg.CooldownSec = 0
+	cfg.MinIntervalSec = 0
+	cfg.MaxPerHour = 100
+	cfg.PersonaAlias = "小鲸鱼"
+	o := newTestObserver(cfg)
+
+	d := o.Decide(msg("qq:g:1", "A", "小鲸鱼在吗", false))
+	if !d.Forward || d.Effort != "medium" || !d.SuppressProgress {
+		t.Fatalf("alias mention should forward as direct conversation: %+v", d)
+	}
+	for _, want := range []string{"先结合上下文判断", "积极回应", "常叫你“小鲸鱼”", "只是提到/转述"} {
+		if !strings.Contains(d.Content, want) {
+			t.Fatalf("direct prompt missing %q", want)
+		}
+	}
+}
+
+func TestPersonaAliasInPrompt(t *testing.T) {
+	cfg := defaultConfig()
+	cfg.CooldownSec = 0
+	cfg.MinIntervalSec = 0
+	cfg.MaxPerHour = 100
+	cfg.PersonaAlias = "小鲸鱼"
+	o := newTestObserver(cfg)
+
+	d := o.Decide(msg("qq:g:1", "A", "你们觉得什么好玩", false))
+	if !d.Forward || !strings.Contains(d.Content, "常叫你“小鲸鱼”") {
+		t.Fatalf("alias should be mentioned in the persona prompt: forward=%v", d.Forward)
 	}
 }
 
@@ -146,14 +187,14 @@ func TestCatchUpSupplementsMissedMessages(t *testing.T) {
 	if o.Decide(msg("qq:g:1", "C", "M3闲聊内容", false)).Forward {
 		t.Fatal("M3 should not forward")
 	}
-	// M4 triggers shadow: prompt must include M2/M3, not M1.
+	// M4 triggers a proactive turn: prompt must include M2/M3, not M1.
 	d4 := o.Decide(msg("qq:g:1", "D", "你们怎么看待这个", false))
 	if !d4.Forward {
 		t.Fatal("M4 should forward")
 	}
 	for _, want := range []string{"M2闲聊内容", "M3闲聊内容", "你们怎么看待这个"} {
 		if !strings.Contains(d4.Content, want) {
-			t.Fatalf("shadow prompt missing %q", want)
+			t.Fatalf("proactive prompt missing %q", want)
 		}
 	}
 	if strings.Contains(d4.Content, "M1at消息") {
@@ -322,6 +363,49 @@ func TestPendingOnlyFirstForwardedRestWaits(t *testing.T) {
 	o.mu.Unlock()
 	if remaining != 1 {
 		t.Fatalf("second pending should stay queued, remaining=%d", remaining)
+	}
+}
+
+func TestPendingFlushPendsCurrentMessage(t *testing.T) {
+	cfg := defaultConfig()
+	cfg.CooldownSec = 0
+	cfg.MinIntervalSec = 0
+	cfg.MaxPerHour = 100
+	o := New(cfg)
+	busy := true
+	o.SetSessionBusy(func(string) bool { return busy })
+	var forwarded []Decision
+	o.SetForwarder(func(_ string, d Decision) error {
+		forwarded = append(forwarded, d)
+		return nil
+	})
+
+	// First candidate pends while busy.
+	if d := o.Decide(msg("qq:g:1", "A", "你们觉得什么好玩", false)); !d.Pending {
+		t.Fatalf("first message should pend while busy: %+v", d)
+	}
+	// Session frees; a new message arrives: the deferred one is forwarded and
+	// the CURRENT message must pend again (serial, one turn at a time).
+	busy = false
+	d := o.Decide(msg("qq:g:1", "B", "还有什么推荐", false))
+	if !d.Pending {
+		t.Fatalf("current message should pend after flushing a deferred forward: %+v", d)
+	}
+	if len(forwarded) != 1 {
+		t.Fatalf("deferred decision should have been forwarded: %d", len(forwarded))
+	}
+	o.mu.Lock()
+	st := o.groups["qq:g:1"]
+	remaining := len(st.pending)
+	o.mu.Unlock()
+	if remaining != 1 {
+		t.Fatalf("current message should be queued pending, remaining=%d", remaining)
+	}
+
+	// After the forwarded turn completes, the pending current is decided.
+	o.OnGroupReply("qq:g:1")
+	if len(forwarded) != 2 {
+		t.Fatalf("pending current should be forwarded after reply: %d", len(forwarded))
 	}
 }
 

@@ -1,11 +1,11 @@
-// Package observer implements the "shadow persona" (影子人格) decision layer
-// for cc-connect group chats.
+// Package observer implements the group-chat passive-participation decision
+// layer (被动插话) for cc-connect group chats.
 //
 // cc-connect hosts the codex sessions; this plugin only decides, for every
 // group message, whether it is forwarded to the agent and with what parameters
 // (prompt content, reasoning effort, progress suppression). It also keeps a
-// rolling buffer so shadow turns can supplement the messages that were skipped
-// between the last real forwarding point and the current trigger.
+// rolling buffer so proactive turns can supplement the messages that were
+// skipped between the last real forwarding point and the current trigger.
 package observer
 
 import (
@@ -29,14 +29,15 @@ type Config struct {
 	MinIntervalSec         int    `toml:"min_interval_sec"`
 	MaxPerHour             int    `toml:"max_per_hour"`
 	RecentRepliesForPrompt int    `toml:"recent_replies_for_prompt"`
-	ReplyRate              int    `toml:"reply_rate"`               // 0-100: participate only in the top X% of topics worth joining
-	WindowSec              int    `toml:"window_sec"`               // unified window: catch-up filter, pending stale-drop, engage window
-	AtEffort               string `toml:"at_effort"`                // reasoning effort for @-triggered turns (default "high")
-	ShadowEffort           string `toml:"shadow_effort"`            // reasoning effort for shadow turns (default "low")
-	SuppressShadowProgress bool   `toml:"suppress_shadow_progress"` // hide thinking/progress for shadow turns
-	PersonaName            string `toml:"persona_name"`             // persona display name; empty uses a generic label
-	CatchupMaxMsgs         int    `toml:"catchup_max_msgs"`         // max skipped messages to supplement
-	CatchupMaxChars        int    `toml:"catchup_max_chars"`        // total supplement text cap (drop oldest beyond this)
+	ReplyRate              int    `toml:"reply_rate"`              // 0-100: participate only in the top X% of topics worth joining
+	WindowSec              int    `toml:"window_sec"`              // unified window: catch-up filter, pending stale-drop, engage window
+	AtEffort               string `toml:"at_effort"`               // reasoning effort for direct turns (@ / nickname), default "medium"
+	ProactiveEffort        string `toml:"proactive_effort"`        // reasoning effort for proactive turns (default "low")
+	SuppressGroupProgress  bool   `toml:"suppress_group_progress"` // hide thinking/progress for all group turns
+	PersonaName            string `toml:"persona_name"`            // persona display name; empty uses a generic label
+	PersonaAlias           string `toml:"persona_alias"`           // alias/nickname; mentioned in the persona when set
+	CatchupMaxMsgs         int    `toml:"catchup_max_msgs"`        // max skipped messages to supplement
+	CatchupMaxChars        int    `toml:"catchup_max_chars"`       // total supplement text cap (drop oldest beyond this)
 	Rules                  []Rule `toml:"rules"`
 }
 
@@ -79,19 +80,19 @@ type ObservedMessage struct {
 // used for per-session frequency control and prompt annotations.
 type replyEvent struct {
 	At   time.Time
-	Kind string // "proactive" (real shadow reply) | "at" (@-triggered main reply)
+	Kind string // "proactive" (real proactive reply) | "at" (@-directed) | "alias" (nickname-directed)
 }
 
 type groupState struct {
 	chatName        string
 	buf             []ObservedMessage
 	replies         []replyEvent
-	pending         []pendingMsg // shadow candidates awaiting the in-flight turn
+	pending         []pendingMsg // proactive candidates awaiting the in-flight turn
 	lastAct         time.Time
 	lastForwardedAt time.Time // newest message actually forwarded to the agent
 }
 
-// pendingMsg is a shadow candidate deferred until the running turn completes.
+// pendingMsg is a proactive candidate deferred until the running turn completes.
 type pendingMsg struct {
 	msg   IncomingMessage
 	entry ObservedMessage
@@ -121,9 +122,9 @@ func defaultConfig() Config {
 		RecentRepliesForPrompt: 10,
 		ReplyRate:              20,
 		WindowSec:              600,
-		AtEffort:               "high",
-		ShadowEffort:           "low",
-		SuppressShadowProgress: true,
+		AtEffort:               "medium",
+		ProactiveEffort:        "low",
+		SuppressGroupProgress:  true,
 		CatchupMaxMsgs:         100,
 		CatchupMaxChars:        2000,
 		Rules: []Rule{{
@@ -177,7 +178,7 @@ func (o *Observer) SetIgnorePatterns(patterns []string) {
 }
 
 // SetSessionBusy registers the host's in-flight-turn check. When a turn is
-// running, non-@ shadow decisions are deferred until it completes.
+// running, non-@ proactive decisions are deferred until it completes.
 func (o *Observer) SetSessionBusy(fn func(sessionKey string) bool) {
 	o.busy = fn
 }
@@ -190,8 +191,9 @@ func (o *Observer) SetForwarder(fn func(sessionKey string, d Decision) error) {
 
 // Decide is the group-message forwarding policy: it records the message,
 // updates the forwarding point, and decides whether/how to forward it.
-// @-bot messages are always forwarded (main persona, at_effort); other
-// messages are forwarded as shadow turns when the activation rules hit.
+// @-bot messages and explicit nickname mentions are direct conversations and
+// always forward with at_effort; other messages are forwarded as proactive
+// turns when the activation rules hit.
 func (o *Observer) Decide(msg IncomingMessage) Decision {
 	if strings.TrimSpace(msg.Content) == "" {
 		return Decision{}
@@ -218,62 +220,74 @@ func (o *Observer) Decide(msg IncomingMessage) Decision {
 		st.buf = st.buf[len(st.buf)-o.cfg.BufferSize:]
 	}
 
-	if msg.Mentioned {
-		st.replies = append(st.replies, replyEvent{At: entry.At, Kind: "at"})
+	if msg.Mentioned || o.aliasMentioned(msg.Content) {
+		kind := "at"
+		if !msg.Mentioned {
+			kind = "alias"
+		}
+		st.replies = append(st.replies, replyEvent{At: entry.At, Kind: kind})
 		pruneReplies(st)
 		st.lastForwardedAt = entry.At
+		prompt := o.buildTurnPrompt(st, entry, nil, kind)
 		o.mu.Unlock()
-		slog.Info("observer: decision", "session", msg.SessionKey, "mentioned", true, "outcome", "forward")
-		return Decision{Forward: true, Content: msg.Content, Effort: effortOr(o.cfg.AtEffort, "high")}
+		slog.Info("observer: decision", "session", msg.SessionKey, "direct", true, "outcome", "forward")
+		return Decision{Forward: true, Content: prompt, Effort: effortOr(o.cfg.AtEffort, "medium"), SuppressProgress: o.cfg.SuppressGroupProgress}
 	}
 
-	// Non-@ candidate. If a turn is in flight, defer the decision until it
-	// completes: the running task changes the last-effective-reply time, which
-	// the shadow decision depends on. (@ messages are decided immediately and
-	// rely on cc-connect's own queueing.)
+	// Non-direct candidate: always enters the pending queue first, then the
+	// queue is processed. Busy -> the entry waits for the next busy-cycle;
+	// free -> "enqueue == dequeue" (processed immediately). Forwarding is
+	// strictly serial: after one entry is forwarded (which injects a turn),
+	// the rest of the queue waits. Direct messages are decided immediately
+	// and rely on cc-connect's own queueing.
+	st.pending = append(st.pending, pendingMsg{msg: msg, entry: entry})
 	if o.busy != nil && o.busy(msg.SessionKey) {
-		st.pending = append(st.pending, pendingMsg{msg: msg, entry: entry})
 		o.mu.Unlock()
 		slog.Info("observer: decision", "session", msg.SessionKey, "busy", true, "outcome", "pending")
 		return Decision{Pending: true}
 	}
 
-	// Flush deferred decisions from earlier busy turns (e.g. turns that ended
-	// without a delivered reply) before deciding the current message.
-	pendingDecisions, requeue := o.processPendingLocked(st)
+	decisions, requeue := o.processPendingLocked(st)
 	st.pending = requeue
-	cur := o.decideShadowLocked(st, pendingMsg{msg: msg, entry: entry})
 	o.mu.Unlock()
 
-	for _, d := range pendingDecisions {
+	if len(decisions) == 0 {
+		slog.Info("observer: decision", "session", msg.SessionKey, "busy", false, "outcome", "drop")
+		return Decision{}
+	}
+	if len(requeue) == 0 {
+		// The current (newest) entry is the one forwarded -> the platform
+		// forwards it now.
+		slog.Info("observer: decision", "session", msg.SessionKey, "busy", false, "outcome", "forward")
+		return decisions[0]
+	}
+	// An earlier entry was forwarded (injecting a turn); the current stays
+	// queued and older decisions are delivered via the forwarder.
+	for _, d := range decisions {
 		if o.forward != nil {
 			if err := o.forward(msg.SessionKey, d); err != nil {
 				slog.Warn("observer: forward deferred decision failed", "session", msg.SessionKey, "error", err)
 			}
 		}
 	}
-	outcome := "drop"
-	if cur.Forward {
-		outcome = "forward"
-	}
-	slog.Info("observer: decision", "session", msg.SessionKey, "busy", false, "outcome", outcome)
-	return cur
+	slog.Info("observer: decision", "session", msg.SessionKey, "busy", false, "outcome", "pending")
+	return Decision{Pending: true}
 }
 
-// decideShadowLocked decides a shadow candidate against the current state.
+// decideProactiveLocked decides a proactive candidate against the current state.
 // The caller must hold o.mu.
-func (o *Observer) decideShadowLocked(st *groupState, p pendingMsg) Decision {
+func (o *Observer) decideProactiveLocked(st *groupState, p pendingMsg) Decision {
 	if !o.maybeActivate(st, p.msg.Content) {
 		return Decision{}
 	}
 	catchup := o.catchUpLocked(st, p.entry.At)
-	prompt := o.buildShadowPrompt(st, p.entry, catchup)
+	prompt := o.buildTurnPrompt(st, p.entry, catchup, "")
 	st.lastForwardedAt = p.entry.At
 	return Decision{
 		Forward:          true,
 		Content:          prompt,
-		Effort:           effortOr(o.cfg.ShadowEffort, "low"),
-		SuppressProgress: o.cfg.SuppressShadowProgress,
+		Effort:           effortOr(o.cfg.ProactiveEffort, "low"),
+		SuppressProgress: o.cfg.SuppressGroupProgress,
 	}
 }
 
@@ -293,7 +307,7 @@ func (o *Observer) OnGroupReply(sessionKey string) {
 	st.pending = nil
 	o.mu.Unlock()
 
-	// Re-decide deferred shadow candidates now that the turn has completed.
+	// Re-decide deferred proactive candidates now that the turn has completed.
 	// If the session is busy again (another turn started), they keep waiting.
 	o.mu.Lock()
 	cur := o.groups[sessionKey]
@@ -318,7 +332,7 @@ func (o *Observer) OnGroupReply(sessionKey string) {
 	}
 }
 
-// processPendingLocked evaluates queued shadow candidates in order: stale ones
+// processPendingLocked evaluates queued proactive candidates in order: stale ones
 // (older than the catchup window) are dropped, non-activating ones are dropped,
 // and processing stops after the first forward so later candidates wait for the
 // next turn completion. Returns decisions to forward and candidates to re-queue.
@@ -329,7 +343,7 @@ func (o *Observer) processPendingLocked(st *groupState) (decisions []Decision, r
 		if o.isStale(p.entry.At) {
 			continue // arrived too long ago; not worth replying now
 		}
-		if d := o.decideShadowLocked(st, p); d.Forward {
+		if d := o.decideProactiveLocked(st, p); d.Forward {
 			decisions = append(decisions, d)
 			forwardIdx = i
 			break
@@ -407,32 +421,35 @@ func (o *Observer) catchUpLocked(st *groupState, now time.Time) []ObservedMessag
 	return cand
 }
 
-// buildShadowPrompt assembles the prompt for a shadow turn: persona, the
-// triggering message, supplemented skipped context, recent reply records and
-// the participation rules.
-func (o *Observer) buildShadowPrompt(st *groupState, trigger ObservedMessage, catchup []ObservedMessage) string {
+// buildTurnPrompt assembles the prompt for a turn: persona, the triggering
+// message, supplemented skipped context, recent reply records and the
+// participation rules. kind is "at" (@-directed, eager reply), "alias"
+// (nickname mentioned; judge whether it is really directed at the bot), or ""
+// (ambient turn; top-X% worth-replying judgment).
+func (o *Observer) buildTurnPrompt(st *groupState, trigger ObservedMessage, catchup []ObservedMessage, kind string) string {
 	var sb strings.Builder
 	persona := o.cfg.PersonaName
 	if strings.TrimSpace(persona) == "" {
 		persona = "本群机器人"
 	}
-	sb.WriteString(`【你的身份与背景】
+	fmt.Fprintf(&sb, `【你的身份】
 
-你是这个群里“` + persona + `”的影子人格：主人格（主会话）负责被 @ 时的正式答疑，而你作为影子一直
-暗中随行、围观群聊，平时像熟朋友一样爱接梗、喜欢帮大家解答各种问题（游戏、生活、数码、
-见闻都可以），有自己的态度，不谄媚、不机械。
+你是这个群里“%s”，是大家眼里的熟朋友：爱聊天、爱接梗，也喜欢帮大家解答各种问题（游戏、生活、
+数码、见闻都可以），乐于分享自己的看法，有自己的态度，不谄媚、不机械。
+`, persona)
+	if alias := strings.TrimSpace(o.cfg.PersonaAlias); alias != "" {
+		fmt.Fprintf(&sb, "- 大家也常叫你“%s”，别人明确这样叫通常就是在直接跟你说话；\n", alias)
+	}
 
-- 主人格不知道你的存在；你始终暗中随行，与他表现一致——不重复他刚说过的话，
-  不推翻他的结论（除非确有明显错误），顺着他的话补充；
-- 分工：主人格处理被 @ 时的正式、深度回答；你负责主动观察、补一句、接住话头、活跃气氛；
-- 对外（群里）你就是` + persona + `本人：不透露存在“影子人格/主会话/双人格”之分，也不要说自己是 AI 分身。
-
-你习惯围观多于插话——大多数时候安静待在群里，遇到值得说的话题才开口。
-
-【本次触发】
-
-你在群里被触发参与，触发你的消息：
-`)
+	sb.WriteString("\n【本次触发】\n\n")
+	switch kind {
+	case "at":
+		sb.WriteString("- 这条消息是被 @ 的直接对话：应当积极回应，一般都要回复；\n")
+	case "alias":
+		fmt.Fprintf(&sb, "- 本条提到了你的昵称：先结合上下文判断是否真的是直接跟你说话；是 → 积极回应；否（只是提到/转述等）→ 按“最值得回复”自我评价，只参与最值得回复的前 %d%% 的话题（不硬凑、不勉强）；\n", replyRate(o.cfg))
+	default:
+		fmt.Fprintf(&sb, "- 这条消息没有被 @ 也没有叫你：按“最值得回复”自我评价，只参与最值得回复的前 %d%% 的话题（不硬凑、不勉强）；\n", replyRate(o.cfg))
+	}
 	fmt.Fprintf(&sb, "%s %s：%s\n", trigger.At.Format("15:04"), trigger.Sender, trigger.Text)
 	if len(catchup) > 0 {
 		sb.WriteString("\n【补充上下文（此前未转交的最近消息）】\n")
@@ -444,18 +461,27 @@ func (o *Observer) buildShadowPrompt(st *groupState, trigger ObservedMessage, ca
 	sb.WriteString("\n你近期的发言/触发记录（注意频控，避免高频刷屏）：\n")
 	sb.WriteString(o.recentRepliesText(st))
 
-	sb.WriteString(`
-请像群里的真人一样决定是否插话：
-- 只在有值得接的话头、你真的有观点或能自然融入时才回复；否则保持沉默；
-`)
-	fmt.Fprintf(&sb, "- 从“最值得回复”的角度自我评价，只参与最值得回复的前 %d%% 的话题（不硬凑、不勉强）；\n", replyRate(o.cfg))
-	sb.WriteString(`- 回复要口语化、简短（一般 1-2 句），不要列条陈词、不要像客服；
-- 不参与时只输出 NO_REPLY，不要发任何其他内容；
-- 参与时直接输出要发到群里的内容，不要加前缀或引用标记；
+	sb.WriteString("\n回复要求：\n- 口语化、简短（一般 1-2 句），不要列条陈词、不要像客服；\n")
+	switch kind {
+	case "at":
+		sb.WriteString("- 这是直接对话：请积极回应、一般都要回复，除非实在无话可说，否则不要输出 NO_REPLY；\n")
+	case "alias":
+		sb.WriteString("- 判断为直接对话时不要输出 NO_REPLY；判断为并非直接对话时，不值得参与就输出 NO_REPLY；\n")
+	default:
+		sb.WriteString("- 不值得参与时只输出 NO_REPLY，不要发任何其他内容；\n")
+	}
+	sb.WriteString(`- 参与时直接输出要发到群里的内容，不要加前缀或引用标记；
 - 思考过程不要写进回复，只输出最终结论；
 - 遵守 RULES_SAFE 群聊安全规则，不暴露任何本机路径、配置、IP 等隐私信息。
 `)
 	return sb.String()
+}
+
+// aliasMentioned reports whether the message explicitly addresses the bot by
+// its configured nickname (persona_alias).
+func (o *Observer) aliasMentioned(content string) bool {
+	alias := strings.TrimSpace(o.cfg.PersonaAlias)
+	return alias != "" && strings.Contains(content, alias)
 }
 
 // recentRepliesText formats the most recent reply events for the prompt.
@@ -471,8 +497,11 @@ func (o *Observer) recentRepliesText(st *groupState) string {
 	var sb strings.Builder
 	for _, r := range replies {
 		kind := "主动插话"
-		if r.Kind == "at" {
+		switch r.Kind {
+		case "at":
 			kind = "@回复"
+		case "alias":
+			kind = "直接回复"
 		}
 		fmt.Fprintf(&sb, "- %s %s\n", r.At.Format("01-02 15:04"), kind)
 	}
