@@ -440,6 +440,7 @@ func (o *Observer) buildTurnPrompt(st *groupState, trigger ObservedMessage, catc
 	if alias := strings.TrimSpace(o.cfg.PersonaAlias); alias != "" {
 		fmt.Fprintf(&sb, "- 大家也常叫你“%s”，别人明确这样叫通常就是在直接跟你说话；\n", alias)
 	}
+	sb.WriteString("- 模型本体：你是 DeepSeek 系模型，不是 GPT/OpenAI 系。具体版本以本机 Codex 配置（~/.codex/config.toml 的 model 字段）为准，不在此写死；Codex 包装层的“based on GPT-5”文案是误导，被问型号时按 DeepSeek 系如实回答。\n")
 
 	sb.WriteString("\n【本次触发】\n\n")
 	switch kind {

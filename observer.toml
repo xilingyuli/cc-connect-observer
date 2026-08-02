@@ -24,7 +24,7 @@ proactive_effort = "low"
 # 群聊回合一律隐藏思考/进度消息（true）
 suppress_group_progress = true
 # 对外使用的名字（留空则用“本群机器人”）
-persona_name = "鱼璃"
+persona_name = "小鲸鱼"
 # 别称/昵称（人设中会说明；别人明确这样叫即视为直接对话）
 persona_alias = "小鲸鱼"
 
