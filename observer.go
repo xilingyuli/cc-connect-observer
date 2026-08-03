@@ -4,8 +4,13 @@
 // cc-connect hosts the codex sessions; this plugin only decides, for every
 // group message, whether it is forwarded to the agent and with what parameters
 // (prompt content, reasoning effort, progress suppression). It also keeps a
-// rolling buffer so proactive turns can supplement the messages that were
-// skipped between the last real forwarding point and the current trigger.
+// pending queue for non-direct messages: when a batch is worth a turn, ALL
+// queued candidates since the last processing point are merged into ONE task so
+// the agent judges in a single pass which of them are worth replying to
+// (instead of one forwarding decision per message), and each reply is delivered
+// as its own group message. The rolling buffer supplies surrounding context for
+// the batch; non-activating candidates are dropped from the queue (they stay in
+// the buffer as context).
 package observer
 
 import (
@@ -20,8 +25,8 @@ import (
 	"github.com/BurntSushi/toml"
 )
 
-// Config is the observer's own configuration (separate file, e.g.
-// ~/.cc-connect/observer.toml).
+// Config is the observer's own configuration (separate TOML file beside the
+// cc-connect config; the path is set via the host's observer setting).
 type Config struct {
 	BufferSize             int    `toml:"buffer_size"`
 	MaxContextMsgs         int    `toml:"max_context_msgs"`
@@ -30,14 +35,13 @@ type Config struct {
 	MaxPerHour             int    `toml:"max_per_hour"`
 	RecentRepliesForPrompt int    `toml:"recent_replies_for_prompt"`
 	ReplyRate              int    `toml:"reply_rate"`              // 0-100: participate only in the top X% of topics worth joining
-	WindowSec              int    `toml:"window_sec"`              // unified window: catch-up filter, pending stale-drop, engage window
+	WindowSec              int    `toml:"window_sec"`              // unified window: pending stale-drop, engage window
 	AtEffort               string `toml:"at_effort"`               // reasoning effort for direct turns (@ / nickname), default "medium"
 	ProactiveEffort        string `toml:"proactive_effort"`        // reasoning effort for proactive turns (default "low")
 	SuppressGroupProgress  bool   `toml:"suppress_group_progress"` // hide thinking/progress for all group turns
 	PersonaName            string `toml:"persona_name"`            // persona display name; empty uses a generic label
 	PersonaAlias           string `toml:"persona_alias"`           // alias/nickname; mentioned in the persona when set
-	CatchupMaxMsgs         int    `toml:"catchup_max_msgs"`        // max skipped messages to supplement
-	CatchupMaxChars        int    `toml:"catchup_max_chars"`       // total supplement text cap (drop oldest beyond this)
+	MaxBatchMsgs           int    `toml:"max_batch_msgs"`          // max queued messages merged into one batch turn
 	Rules                  []Rule `toml:"rules"`
 }
 
@@ -53,11 +57,16 @@ type Rule struct {
 // IncomingMessage is the minimal message view the observer needs from the
 // platform (the host adapts its own message type into this one).
 type IncomingMessage struct {
-	SessionKey string
-	UserName   string
-	ChatName   string
-	Content    string
-	Mentioned  bool
+	SessionKey        string
+	MessageID         string
+	UserID            string
+	UserName          string
+	ChatName          string
+	Content           string
+	Mentioned         bool
+	QuotedMessageID   string // platform message ID this message replies to (quote), if any
+	MediaKind         string // "图片"/"语音"/"文件" when the message carries media (text may be empty)
+	UserMessageTimeMs int64  // real platform message time (Unix ms); 0 = use arrival time
 }
 
 // Decision is the forwarding decision the host executes.
@@ -67,13 +76,18 @@ type Decision struct {
 	Content          string // prompt/content to send; empty keeps the original
 	Effort           string // reasoning effort override for this turn
 	SuppressProgress bool   // hide thinking/tool progress for this turn
+	SplitReplies     bool   // final response may carry several "---"-separated replies, each sent separately
 }
 
-// ObservedMessage is one buffered group message (text only).
+// ObservedMessage is one buffered group message (text plus identity metadata).
 type ObservedMessage struct {
-	At     time.Time
-	Sender string
-	Text   string
+	At              time.Time
+	MessageID       string
+	UserID          string
+	Sender          string
+	Text            string
+	QuotedMessageID string
+	MediaKind       string
 }
 
 // replyEvent records when the bot replied (or was @-triggered) in a group,
@@ -87,7 +101,7 @@ type groupState struct {
 	chatName        string
 	buf             []ObservedMessage
 	replies         []replyEvent
-	pending         []pendingMsg // proactive candidates awaiting the in-flight turn
+	pending         []pendingMsg // non-direct candidates awaiting a batch turn
 	lastAct         time.Time
 	lastForwardedAt time.Time // newest message actually forwarded to the agent
 }
@@ -99,6 +113,7 @@ type pendingMsg struct {
 }
 
 const maxReplyEvents = 30
+const maxPending = 500 // storage cap for the pending queue (most recent kept)
 
 // Observer is the decision layer (one per engine/project).
 type Observer struct {
@@ -125,8 +140,7 @@ func defaultConfig() Config {
 		AtEffort:               "medium",
 		ProactiveEffort:        "low",
 		SuppressGroupProgress:  true,
-		CatchupMaxMsgs:         100,
-		CatchupMaxChars:        2000,
+		MaxBatchMsgs:           100,
 		Rules: []Rule{{
 			Type:  "keyword",
 			Regex: []string{"什么", "怎么", "吗", "呢", "你们", "？"},
@@ -195,7 +209,7 @@ func (o *Observer) SetForwarder(fn func(sessionKey string, d Decision) error) {
 // always forward with at_effort; other messages are forwarded as proactive
 // turns when the activation rules hit.
 func (o *Observer) Decide(msg IncomingMessage) Decision {
-	if strings.TrimSpace(msg.Content) == "" {
+	if strings.TrimSpace(msg.Content) == "" && msg.MediaKind == "" {
 		return Decision{}
 	}
 	for _, re := range o.ignore {
@@ -214,7 +228,19 @@ func (o *Observer) Decide(msg IncomingMessage) Decision {
 	if msg.ChatName != "" {
 		st.chatName = msg.ChatName
 	}
-	entry := ObservedMessage{At: time.Now(), Sender: msg.UserName, Text: truncate(msg.Content, 300)}
+	at := time.Now()
+	if msg.UserMessageTimeMs > 0 {
+		at = time.UnixMilli(msg.UserMessageTimeMs)
+	}
+	entry := ObservedMessage{
+		At:              at,
+		MessageID:       msg.MessageID,
+		UserID:          msg.UserID,
+		Sender:          msg.UserName,
+		Text:            truncate(msg.Content, 300),
+		QuotedMessageID: msg.QuotedMessageID,
+		MediaKind:       msg.MediaKind,
+	}
 	st.buf = append(st.buf, entry)
 	if o.cfg.BufferSize > 0 && len(st.buf) > o.cfg.BufferSize {
 		st.buf = st.buf[len(st.buf)-o.cfg.BufferSize:]
@@ -236,11 +262,13 @@ func (o *Observer) Decide(msg IncomingMessage) Decision {
 
 	// Non-direct candidate: always enters the pending queue first, then the
 	// queue is processed. Busy -> the entry waits for the next busy-cycle;
-	// free -> "enqueue == dequeue" (processed immediately). Forwarding is
-	// strictly serial: after one entry is forwarded (which injects a turn),
-	// the rest of the queue waits. Direct messages are decided immediately
-	// and rely on cc-connect's own queueing.
+	// free -> "enqueue == dequeue" (processed immediately). Non-activating
+	// entries stay queued so they can ride along with a later batch. Direct
+	// messages are decided immediately and rely on cc-connect's own queueing.
 	st.pending = append(st.pending, pendingMsg{msg: msg, entry: entry})
+	if len(st.pending) > maxPending {
+		st.pending = st.pending[len(st.pending)-maxPending:]
+	}
 	if o.busy != nil && o.busy(msg.SessionKey) {
 		o.mu.Unlock()
 		slog.Info("observer: decision", "session", msg.SessionKey, "busy", true, "outcome", "pending")
@@ -255,40 +283,8 @@ func (o *Observer) Decide(msg IncomingMessage) Decision {
 		slog.Info("observer: decision", "session", msg.SessionKey, "busy", false, "outcome", "drop")
 		return Decision{}
 	}
-	if len(requeue) == 0 {
-		// The current (newest) entry is the one forwarded -> the platform
-		// forwards it now.
-		slog.Info("observer: decision", "session", msg.SessionKey, "busy", false, "outcome", "forward")
-		return decisions[0]
-	}
-	// An earlier entry was forwarded (injecting a turn); the current stays
-	// queued and older decisions are delivered via the forwarder.
-	for _, d := range decisions {
-		if o.forward != nil {
-			if err := o.forward(msg.SessionKey, d); err != nil {
-				slog.Warn("observer: forward deferred decision failed", "session", msg.SessionKey, "error", err)
-			}
-		}
-	}
-	slog.Info("observer: decision", "session", msg.SessionKey, "busy", false, "outcome", "pending")
-	return Decision{Pending: true}
-}
-
-// decideProactiveLocked decides a proactive candidate against the current state.
-// The caller must hold o.mu.
-func (o *Observer) decideProactiveLocked(st *groupState, p pendingMsg) Decision {
-	if !o.maybeActivate(st, p.msg.Content) {
-		return Decision{}
-	}
-	catchup := o.catchUpLocked(st, p.entry.At)
-	prompt := o.buildTurnPrompt(st, p.entry, catchup, "")
-	st.lastForwardedAt = p.entry.At
-	return Decision{
-		Forward:          true,
-		Content:          prompt,
-		Effort:           effortOr(o.cfg.ProactiveEffort, "low"),
-		SuppressProgress: o.cfg.SuppressGroupProgress,
-	}
+	slog.Info("observer: decision", "session", msg.SessionKey, "busy", false, "outcome", "forward")
+	return decisions[0]
 }
 
 // OnGroupReply records a real reply actually delivered in a group (reported by
@@ -303,21 +299,31 @@ func (o *Observer) OnGroupReply(sessionKey string) {
 	}
 	st.replies = append(st.replies, replyEvent{At: time.Now(), Kind: "proactive"})
 	pruneReplies(st)
-	pending := st.pending
-	st.pending = nil
 	o.mu.Unlock()
 
-	// Re-decide deferred proactive candidates now that the turn has completed.
-	// If the session is busy again (another turn started), they keep waiting.
+	o.redecidePending(sessionKey)
+}
+
+// OnSilentTurn is called when a group turn completed without a real reply
+// (NO_REPLY). It does not record a reply event (a silent turn is not a real
+// reply for engage-window/frequency tracking) but still re-evaluates the
+// pending queue so follow-up messages are not left to expire while the queue
+// waits for the next message.
+func (o *Observer) OnSilentTurn(sessionKey string) {
+	o.redecidePending(sessionKey)
+}
+
+// redecidePending re-evaluates deferred proactive candidates now that a turn
+// has completed. If the session is busy again (another turn started), they
+// keep waiting.
+func (o *Observer) redecidePending(sessionKey string) {
 	o.mu.Lock()
 	cur := o.groups[sessionKey]
 	if cur == nil || (o.busy != nil && o.busy(sessionKey)) {
-		if cur != nil {
-			cur.pending = append(cur.pending, pending...)
-		}
 		o.mu.Unlock()
 		return
 	}
+	pending := cur.pending
 	cur.pending = pending
 	decisions, requeue := o.processPendingLocked(cur)
 	cur.pending = requeue
@@ -332,39 +338,52 @@ func (o *Observer) OnGroupReply(sessionKey string) {
 	}
 }
 
-// processPendingLocked evaluates queued proactive candidates in order: stale ones
-// (older than the catchup window) are dropped, non-activating ones are dropped,
-// and processing stops after the first forward so later candidates wait for the
-// next turn completion. Returns decisions to forward and candidates to re-queue.
-// The caller must hold o.mu.
+// processPendingLocked evaluates the queued candidates as ONE batch: stale
+// entries are dropped, and if the batch is worth a turn (the engage window is
+// open or at least one candidate hits an activation rule, within
+// cooldown/frequency limits), ALL non-stale candidates are merged into a single
+// decision so the agent judges which of them to reply to in one pass. Returns
+// at most one decision; candidates that did not justify a turn are dropped (the
+// rolling buffer still keeps them as context for a later batch). The caller
+// must hold o.mu.
 func (o *Observer) processPendingLocked(st *groupState) (decisions []Decision, requeue []pendingMsg) {
-	forwardIdx := -1
-	for i, p := range st.pending {
-		if o.isStale(p.entry.At) {
-			continue // arrived too long ago; not worth replying now
-		}
-		if d := o.decideProactiveLocked(st, p); d.Forward {
-			decisions = append(decisions, d)
-			forwardIdx = i
-			break
+	live := make([]pendingMsg, 0, len(st.pending))
+	for _, p := range st.pending {
+		if !o.isStale(p.entry.At) {
+			live = append(live, p)
 		}
 	}
-	if forwardIdx >= 0 && forwardIdx+1 < len(st.pending) {
-		requeue = append(requeue, st.pending[forwardIdx+1:]...)
+	if len(live) == 0 {
+		return nil, nil
 	}
-	return decisions, requeue
+	batch := live
+	if n := o.cfg.MaxBatchMsgs; n > 0 && len(batch) > n {
+		batch = batch[len(batch)-n:]
+	}
+	if !o.batchActivateLocked(st, batch) {
+		return nil, nil // not worth a turn; drop (buffer keeps them as context)
+	}
+	kind := ""
+	if o.engageActive(st) {
+		kind = "engage"
+	}
+	prompt := o.buildBatchPrompt(st, batch, kind)
+	st.lastForwardedAt = batch[len(batch)-1].entry.At
+	return []Decision{{
+		Forward:          true,
+		Content:          prompt,
+		Effort:           effortOr(o.cfg.ProactiveEffort, "low"),
+		SuppressProgress: o.cfg.SuppressGroupProgress,
+		SplitReplies:     true,
+	}}, nil
 }
 
-// isStale reports whether a buffered/pending message is too old to reply to,
-// using the unified time window (window_sec).
-func (o *Observer) isStale(at time.Time) bool {
-	w := time.Duration(o.cfg.WindowSec) * time.Second
-	return w > 0 && time.Since(at) > w
-}
-
-// maybeActivate applies cooldown, proactive-frequency limits, the engage
-// window, then the activation rules.
-func (o *Observer) maybeActivate(st *groupState, content string) bool {
+// batchActivateLocked decides whether the pending batch deserves one AI turn.
+// Cooldown / min-interval / max-per-hour guards apply to the batch as a whole
+// (one batch = one potential proactive turn); then either the engage window is
+// open or at least one candidate matches an activation rule. The caller must
+// hold o.mu.
+func (o *Observer) batchActivateLocked(st *groupState, batch []pendingMsg) bool {
 	now := time.Now()
 	if !st.lastAct.IsZero() && now.Sub(st.lastAct) < time.Duration(o.cfg.CooldownSec)*time.Second {
 		return false
@@ -375,72 +394,36 @@ func (o *Observer) maybeActivate(st *groupState, content string) bool {
 	if o.cfg.MaxPerHour > 0 && proactiveCountInHour(st, now) >= o.cfg.MaxPerHour {
 		return false
 	}
-	// Engage window: within window_sec after a real proactive reply, keep
-	// delivering conversation turns even without a keyword match.
-	if last := lastProactive(st); !last.IsZero() && now.Sub(last) < time.Duration(o.cfg.WindowSec)*time.Second {
+	if o.engageActive(st) {
 		st.lastAct = now
 		return true
 	}
-	if !o.rulesMatch(st, content, now) {
-		return false
+	for _, p := range batch {
+		if o.rulesMatch(st, p.msg.Content, now) {
+			st.lastAct = now
+			return true
+		}
 	}
-	st.lastAct = now
-	return true
+	return false
 }
 
-// catchUpLocked returns the messages observed after the last real forwarding
-// point and before the current trigger: text only, most recent N, within the
-// time window, and capped by total characters (older parts dropped first).
-func (o *Observer) catchUpLocked(st *groupState, now time.Time) []ObservedMessage {
-	window := time.Duration(o.cfg.WindowSec) * time.Second
-	var cand []ObservedMessage
-	for _, m := range st.buf {
-		if !m.At.After(st.lastForwardedAt) || !m.At.Before(now) {
-			continue
-		}
-		if window > 0 && now.Sub(m.At) > window {
-			continue
-		}
-		cand = append(cand, m)
-	}
-	if n := o.cfg.CatchupMaxMsgs; n > 0 && len(cand) > n {
-		cand = cand[len(cand)-n:]
-	}
-	if capChars := o.cfg.CatchupMaxChars; capChars > 0 {
-		total := 0
-		start := 0
-		for i := len(cand) - 1; i >= 0; i-- {
-			total += len([]rune(cand[i].Text))
-			if total > capChars {
-				start = i + 1
-				break
-			}
-		}
-		cand = cand[start:]
-	}
-	return cand
+// isStale reports whether a buffered/pending message is too old to reply to,
+// using the unified time window (window_sec).
+func (o *Observer) isStale(at time.Time) bool {
+	w := time.Duration(o.cfg.WindowSec) * time.Second
+	return w > 0 && time.Since(at) > w
 }
 
 // buildTurnPrompt assembles the prompt for a turn: persona, the triggering
 // message, supplemented skipped context, recent reply records and the
 // participation rules. kind is "at" (@-directed, eager reply), "alias"
-// (nickname mentioned; judge whether it is really directed at the bot), or ""
+// (nickname mentioned; judge whether it is really directed at the bot),
+// "engage" (message inside the engage window after a recent reply; the model
+// judges from message time and text whether it is directed at the bot), or ""
 // (ambient turn; top-X% worth-replying judgment).
 func (o *Observer) buildTurnPrompt(st *groupState, trigger ObservedMessage, catchup []ObservedMessage, kind string) string {
 	var sb strings.Builder
-	persona := o.cfg.PersonaName
-	if strings.TrimSpace(persona) == "" {
-		persona = "本群机器人"
-	}
-	fmt.Fprintf(&sb, `【你的身份】
-
-你是这个群里“%s”，是大家眼里的熟朋友：爱聊天、爱接梗，也喜欢帮大家解答各种问题（游戏、生活、
-数码、见闻都可以），乐于分享自己的看法，有自己的态度，不谄媚、不机械。
-`, persona)
-	if alias := strings.TrimSpace(o.cfg.PersonaAlias); alias != "" {
-		fmt.Fprintf(&sb, "- 大家也常叫你“%s”，别人明确这样叫通常就是在直接跟你说话；\n", alias)
-	}
-	sb.WriteString("- 模型本体：你是 DeepSeek 系模型，不是 GPT/OpenAI 系。具体版本以本机 Codex 配置（~/.codex/config.toml 的 model 字段）为准，不在此写死；Codex 包装层的“based on GPT-5”文案是误导，被问型号时按 DeepSeek 系如实回答。\n")
+	o.writePersona(&sb)
 
 	sb.WriteString("\n【本次触发】\n\n")
 	switch kind {
@@ -448,6 +431,8 @@ func (o *Observer) buildTurnPrompt(st *groupState, trigger ObservedMessage, catc
 		sb.WriteString("- 这条消息是被 @ 的直接对话：应当积极回应，一般都要回复；\n")
 	case "alias":
 		fmt.Fprintf(&sb, "- 本条提到了你的昵称：先结合上下文判断是否真的是直接跟你说话；是 → 积极回应；否（只是提到/转述等）→ 按“最值得回复”自我评价，只参与最值得回复的前 %d%% 的话题（不硬凑、不勉强）；\n", replyRate(o.cfg))
+	case "engage":
+		fmt.Fprintf(&sb, "- 依据消息时间与文本判断是否在与自己对话；是 → 积极回应；否 → 只参与最值得回复的前 %d%% 的话题（不硬凑、不勉强）；\n", replyRate(o.cfg))
 	default:
 		fmt.Fprintf(&sb, "- 这条消息没有被 @ 也没有叫你：按“最值得回复”自我评价，只参与最值得回复的前 %d%% 的话题（不硬凑、不勉强）；\n", replyRate(o.cfg))
 	}
@@ -468,6 +453,8 @@ func (o *Observer) buildTurnPrompt(st *groupState, trigger ObservedMessage, catc
 		sb.WriteString("- 这是直接对话：请积极回应、一般都要回复，除非实在无话可说，否则不要输出 NO_REPLY；\n")
 	case "alias":
 		sb.WriteString("- 判断为直接对话时不要输出 NO_REPLY；判断为并非直接对话时，不值得参与就输出 NO_REPLY；\n")
+	case "engage":
+		sb.WriteString("- 判断为在跟你对话（追问/接话/点名）时不要输出 NO_REPLY；判断并非对你所说时，不值得参与就输出 NO_REPLY；\n")
 	default:
 		sb.WriteString("- 不值得参与时只输出 NO_REPLY，不要发任何其他内容；\n")
 	}
@@ -476,6 +463,122 @@ func (o *Observer) buildTurnPrompt(st *groupState, trigger ObservedMessage, catc
 - 遵守 RULES_SAFE 群聊安全规则，不暴露任何本机路径、配置、IP 等隐私信息。
 `)
 	return sb.String()
+}
+
+// buildBatchPrompt assembles the prompt for a merged pending-batch turn: the
+// persona, all queued candidate messages (with time/sender), recent reply
+// records and the batch participation rules. kind is "engage" (inside the
+// engage window; judge first whether each message is directed at the bot) or
+// "" (ambient batch; reply only to the top-worth candidates).
+func (o *Observer) buildBatchPrompt(st *groupState, batch []pendingMsg, kind string) string {
+	var sb strings.Builder
+	o.writePersona(&sb)
+
+	fmt.Fprintf(&sb, "\n【本次待处理的排队消息】\n\n")
+	fmt.Fprintf(&sb, "以下是此前排队、尚未处理的 %d 条群消息（按时间顺序），需要你判断是否回复：\n", len(batch))
+	for i, p := range batch {
+		fmt.Fprintf(&sb, "%02d. %s %s%s：%s%s%s\n", i+1, p.entry.At.Format("15:04"), p.entry.Sender, qqSuffix(p.msg.UserID), p.entry.Text, quotedSuffix(p.entry.QuotedMessageID), mediaSuffix(p.entry.MediaKind, p.entry.MessageID))
+	}
+
+	if ctx := o.batchContextLocked(st, batch); len(ctx) > 0 {
+		sb.WriteString("\n【补充上下文（此前未转交的最近消息，仅作背景，不必回复）】\n")
+		for i, m := range ctx {
+			fmt.Fprintf(&sb, "%02d. %s %s%s：%s%s%s\n", i+1, m.At.Format("15:04"), m.Sender, qqSuffix(m.UserID), m.Text, quotedSuffix(m.QuotedMessageID), mediaSuffix(m.MediaKind, m.MessageID))
+		}
+	}
+
+	sb.WriteString("\n你近期的发言/触发记录（注意频控，避免高频刷屏）：\n")
+	sb.WriteString(o.recentRepliesText(st))
+
+	sb.WriteString("\n回复要求：\n")
+	sb.WriteString("- 判断哪些排队消息值得回复，选择性回复；\n")
+	sb.WriteString("- 媒体消息（图片/语音/文件）不需要判断是否回复，仅作上下文；\n")
+	sb.WriteString("- 需要时可自行查询任意消息详情（OneBot v11 get_msg，消息 id 见上方列表）；\n")
+	if kind == "engage" {
+		sb.WriteString("- 先依据消息时间与文本判断是否在与自己对话；是 → 积极回应；否则按值得度挑选；\n")
+	}
+	sb.WriteString("- 每条回复单独发一条群消息，回复多条时用单独一行 --- 分隔；\n")
+	sb.WriteString("- 没有值得回复的就只输出 NO_REPLY。\n")
+	sb.WriteString("- 遵守 RULES_SAFE 群聊安全规则，不暴露任何本机路径、配置、IP 等隐私信息。\n")
+	return sb.String()
+}
+
+// batchContextLocked returns recent buffer messages around the batch as
+// background context: observed messages after the last forwarding point and
+// within the time window, excluding the candidates already listed in the batch
+// (they are the action items, not background). Total text is capped by
+// characters, keeping the most recent entries. The caller must hold o.mu.
+func (o *Observer) batchContextLocked(st *groupState, batch []pendingMsg) []ObservedMessage {
+	inBatch := make(map[ObservedMessage]bool, len(batch))
+	for _, p := range batch {
+		inBatch[p.entry] = true
+	}
+	window := time.Duration(o.cfg.WindowSec) * time.Second
+	var cand []ObservedMessage
+	for _, m := range st.buf {
+		if inBatch[m] {
+			continue
+		}
+		if !m.At.After(st.lastForwardedAt) {
+			continue
+		}
+		if window > 0 && time.Since(m.At) > window {
+			continue
+		}
+		cand = append(cand, m)
+	}
+	const maxContextChars = 2000
+	total := 0
+	start := 0
+	for i := len(cand) - 1; i >= 0; i-- {
+		total += len([]rune(cand[i].Text))
+		if total > maxContextChars {
+			start = i + 1
+			break
+		}
+	}
+	return cand[start:]
+}
+
+func qqSuffix(uid string) string {
+	if uid == "" {
+		return ""
+	}
+	return "（QQ " + uid + "）"
+}
+
+func quotedSuffix(qid string) string {
+	if qid == "" {
+		return ""
+	}
+	return "〔引用 id " + qid + "〕"
+}
+
+func mediaSuffix(kind, mid string) string {
+	if kind == "" {
+		return ""
+	}
+	if mid == "" {
+		return "〔" + kind + "消息〕"
+	}
+	return "〔" + kind + " id " + mid + "〕"
+}
+
+// writePersona writes the persona block shared by all turn prompts.
+func (o *Observer) writePersona(sb *strings.Builder) {
+	persona := o.cfg.PersonaName
+	if strings.TrimSpace(persona) == "" {
+		persona = "本群机器人"
+	}
+	fmt.Fprintf(sb, `【你的身份】
+
+你是这个群里“%s”，是大家眼里的熟朋友：爱聊天、爱接梗，也喜欢帮大家解答各种问题（游戏、生活、
+数码、见闻都可以），乐于分享自己的看法，有自己的态度，不谄媚、不机械。
+`, persona)
+	if alias := strings.TrimSpace(o.cfg.PersonaAlias); alias != "" {
+		fmt.Fprintf(sb, "- 大家也常叫你“%s”，别人明确这样叫通常就是在直接跟你说话；\n", alias)
+	}
+	sb.WriteString("- 模型本体：你是 DeepSeek 系模型，不是 GPT/OpenAI 系。具体版本以 codex 配置文件中的本机模型为准，不在此写死；Codex 包装层的“based on GPT-5”文案是误导，被问型号时按 DeepSeek 系如实回答。\n")
 }
 
 // aliasMentioned reports whether the message explicitly addresses the bot by
@@ -553,6 +656,26 @@ func lastProactive(st *groupState) time.Time {
 		}
 	}
 	return time.Time{}
+}
+
+// lastReply returns the most recent reply event of any kind (proactive, @, or
+// alias). It backs the engage window so a follow-up after ANY reply is treated
+// as a continuation of the conversation.
+func lastReply(st *groupState) time.Time {
+	for i := len(st.replies) - 1; i >= 0; i-- {
+		return st.replies[i].At
+	}
+	return time.Time{}
+}
+
+// engageActive reports whether the engage window is currently open, i.e. a
+// real reply of any kind happened within window_sec.
+func (o *Observer) engageActive(st *groupState) bool {
+	last := lastReply(st)
+	if last.IsZero() || o.cfg.WindowSec <= 0 {
+		return false
+	}
+	return time.Since(last) < time.Duration(o.cfg.WindowSec)*time.Second
 }
 
 func proactiveCountInHour(st *groupState, now time.Time) int {

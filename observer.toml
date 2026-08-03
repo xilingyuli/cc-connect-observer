@@ -14,8 +14,10 @@ max_per_hour = 1000
 recent_replies_for_prompt = 10
 # 回复率：只参与你认为属于前 X% 值得参与的话题（测试期可设 100）
 reply_rate = 20
-# 统一时间窗口（秒）：补转交过滤 / pending 超时即弃 / 真实回复后持续投递共用
+# 统一时间窗口（秒）：pending 超时即弃 / 真实回复后持续投递共用
 window_sec = 600
+# 一次批量回合最多合并的排队消息条数（超出部分丢弃最旧的）
+max_batch_msgs = 100
 
 # @ 或叫昵称（直接对话）的推理强度
 at_effort = "medium"
@@ -27,10 +29,6 @@ suppress_group_progress = true
 persona_name = "小鲸鱼"
 # 别称/昵称（人设中会说明；别人明确这样叫即视为直接对话）
 persona_alias = "小鲸鱼"
-
-# 补转交：补上次真实转交点到本次触发之间未转交的最近文本消息
-catchup_max_msgs = 100
-catchup_max_chars = 2000
 
 # 激活规则列表（v1 实现 keyword，后续可扩展 burst / multi_user / random）
 [[rules]]

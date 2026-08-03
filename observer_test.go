@@ -45,10 +45,18 @@ func TestKeywordActivationForwardsProactive(t *testing.T) {
 	if d.Effort != "low" || !d.SuppressProgress {
 		t.Fatalf("proactive decision should use low effort + suppress progress: %+v", d)
 	}
-	for _, want := range []string{"你的身份", "本次触发", "NO_REPLY", "最值得回复的前 20%"} {
+	for _, want := range []string{"你的身份", "排队", "NO_REPLY", "选择性回复"} {
 		if !strings.Contains(d.Content, want) {
 			t.Fatalf("proactive prompt missing %q", want)
 		}
+	}
+	for _, forbidden := range []string{"最多 5 条", "口语化", "简短"} {
+		if strings.Contains(d.Content, forbidden) {
+			t.Fatalf("proactive prompt should not contain %q", forbidden)
+		}
+	}
+	if !d.SplitReplies {
+		t.Fatal("proactive batch decision should carry SplitReplies")
 	}
 }
 
@@ -149,6 +157,59 @@ func TestEngageWindowForwardsWithoutKeyword(t *testing.T) {
 	}
 }
 
+func TestEngageWindowAfterAtReplyForwardsFollowUp(t *testing.T) {
+	cfg := defaultConfig()
+	cfg.WindowSec = 600
+	cfg.CooldownSec = 0
+	cfg.MinIntervalSec = 0
+	cfg.MaxPerHour = 100
+	o := New(cfg)
+
+	// @ direct turn, then the bot actually replies to it.
+	if d := o.Decide(msg("qq:g:1", "A", "在吗", true)); !d.Forward {
+		t.Fatal("@ message should forward")
+	}
+	o.OnGroupReply("qq:g:1")
+
+	// Follow-up without @ / alias / keyword must still forward as a
+	// continuation within the engage window opened by the @ reply.
+	d := o.Decide(msg("qq:g:1", "A", "继续展开说说", false))
+	if !d.Forward {
+		t.Fatal("follow-up after @ reply should forward within engage window")
+	}
+	for _, want := range []string{"时间", "与自己对", "积极回应"} {
+		if !strings.Contains(d.Content, want) {
+			t.Fatalf("engage prompt missing %q", want)
+		}
+	}
+	if strings.Contains(d.Content, "被 @ 的直接对话") {
+		t.Fatal("engage follow-up should not be framed as an @ direct turn")
+	}
+}
+
+func TestEngageWindowAfterAliasReplyForwardsFollowUp(t *testing.T) {
+	cfg := defaultConfig()
+	cfg.WindowSec = 600
+	cfg.CooldownSec = 0
+	cfg.MinIntervalSec = 0
+	cfg.MaxPerHour = 100
+	cfg.PersonaAlias = "小鲸鱼"
+	o := New(cfg)
+
+	if d := o.Decide(msg("qq:g:1", "A", "小鲸鱼在吗", false)); !d.Forward {
+		t.Fatal("alias mention should forward")
+	}
+	o.OnGroupReply("qq:g:1")
+
+	d := o.Decide(msg("qq:g:1", "A", "然后呢", false))
+	if !d.Forward {
+		t.Fatal("follow-up after alias reply should forward within engage window")
+	}
+	if !strings.Contains(d.Content, "与自己对") {
+		t.Fatalf("engage prompt missing continuation framing: %+v", d)
+	}
+}
+
 func TestEngageWindowExpiresWithoutKeyword(t *testing.T) {
 	cfg := defaultConfig()
 	cfg.WindowSec = 600
@@ -168,26 +229,26 @@ func TestEngageWindowExpiresWithoutKeyword(t *testing.T) {
 	}
 }
 
-func TestCatchUpSupplementsMissedMessages(t *testing.T) {
+func TestBatchIncludesEarlierPendingMessages(t *testing.T) {
 	cfg := defaultConfig()
 	cfg.CooldownSec = 0
 	cfg.MinIntervalSec = 0
 	cfg.MaxPerHour = 100
 	o := newTestObserver(cfg)
 
-	// M1 @ -> forwarded, sets the forwarding point.
+	// M1 @ -> forwarded immediately.
 	d1 := o.Decide(msg("qq:g:1", "A", "M1at消息", true))
 	if !d1.Forward {
 		t.Fatal("M1 should forward")
 	}
-	// M2/M3 missed (no keyword).
+	// M2/M3 have no keyword: they stay queued, no turn yet.
 	if o.Decide(msg("qq:g:1", "B", "M2闲聊内容", false)).Forward {
 		t.Fatal("M2 should not forward")
 	}
 	if o.Decide(msg("qq:g:1", "C", "M3闲聊内容", false)).Forward {
 		t.Fatal("M3 should not forward")
 	}
-	// M4 triggers a proactive turn: prompt must include M2/M3, not M1.
+	// M4 triggers a batch turn: the whole queue is merged, M1 not included.
 	d4 := o.Decide(msg("qq:g:1", "D", "你们怎么看待这个", false))
 	if !d4.Forward {
 		t.Fatal("M4 should forward")
@@ -198,27 +259,49 @@ func TestCatchUpSupplementsMissedMessages(t *testing.T) {
 		}
 	}
 	if strings.Contains(d4.Content, "M1at消息") {
-		t.Fatal("already-forwarded M1 should not be re-supplemented")
+		t.Fatal("already-forwarded M1 should not be re-included")
 	}
 }
 
-func TestCatchUpWindowExcludesOldMessages(t *testing.T) {
+func TestBatchExcludesStalePending(t *testing.T) {
 	cfg := defaultConfig()
 	cfg.CooldownSec = 0
 	cfg.MinIntervalSec = 0
 	cfg.MaxPerHour = 100
 	cfg.WindowSec = 600
 	o := New(cfg)
-	now := time.Now()
-	st := &groupState{lastForwardedAt: now.Add(-3 * time.Hour)}
-	st.buf = append(st.buf, ObservedMessage{At: now.Add(-2 * time.Hour), Sender: "X", Text: "很旧的消息"})
+	busy := true
+	o.SetSessionBusy(func(string) bool { return busy })
+	var forwarded []Decision
+	o.SetForwarder(func(_ string, d Decision) error {
+		forwarded = append(forwarded, d)
+		return nil
+	})
+
+	o.Decide(msg("qq:g:1", "A", "很旧的话题你们怎么看", false))
+	o.Decide(msg("qq:g:1", "B", "新的话题你们怎么看", false))
+
+	// Age only the first pending entry (and its buffer twin) beyond the window.
 	o.mu.Lock()
-	o.groups["qq:g:1"] = st
+	st := o.groups["qq:g:1"]
+	st.pending[0].entry.At = time.Now().Add(-2 * time.Hour)
+	for i := range st.buf {
+		if st.buf[i].Text == "很旧的话题你们怎么看" {
+			st.buf[i].At = time.Now().Add(-2 * time.Hour)
+		}
+	}
 	o.mu.Unlock()
 
-	d := o.Decide(msg("qq:g:1", "D", "你们怎么看", false))
-	if d.Forward && strings.Contains(d.Content, "很旧的消息") {
-		t.Fatal("old message outside catchup window should be excluded")
+	busy = false
+	o.OnGroupReply("qq:g:1")
+	if len(forwarded) != 1 {
+		t.Fatalf("expected one batch decision, got %d", len(forwarded))
+	}
+	if strings.Contains(forwarded[0].Content, "很旧的话题") {
+		t.Fatal("stale pending message should be excluded from the batch")
+	}
+	if !strings.Contains(forwarded[0].Content, "新的话题") {
+		t.Fatal("fresh pending message should be included in the batch")
 	}
 }
 
@@ -304,6 +387,51 @@ func TestPendingDecidedAfterReply(t *testing.T) {
 	}
 }
 
+func TestPendingDecidedAfterSilentTurn(t *testing.T) {
+	cfg := defaultConfig()
+	cfg.CooldownSec = 0
+	cfg.MinIntervalSec = 0
+	cfg.MaxPerHour = 100
+	o := New(cfg)
+	busy := true
+	o.SetSessionBusy(func(string) bool { return busy })
+	var forwarded []Decision
+	o.SetForwarder(func(_ string, d Decision) error {
+		forwarded = append(forwarded, d)
+		return nil
+	})
+
+	if d := o.Decide(msg("qq:g:1", "A", "你们觉得什么好玩", false)); !d.Pending {
+		t.Fatalf("should pend while busy: %+v", d)
+	}
+
+	// The in-flight turn completes with NO_REPLY: the pending queue must still
+	// be re-evaluated instead of waiting for the next message.
+	busy = false
+	o.OnSilentTurn("qq:g:1")
+	if len(forwarded) != 1 || !forwarded[0].Forward {
+		t.Fatalf("pending should be forwarded after silent turn: %v", forwarded)
+	}
+}
+
+func TestOnSilentTurnDoesNotRecordReply(t *testing.T) {
+	cfg := defaultConfig()
+	cfg.CooldownSec = 0
+	cfg.MinIntervalSec = 0
+	cfg.MaxPerHour = 100
+	o := newTestObserver(cfg)
+
+	o.Decide(msg("qq:g:1", "A", "为什么", false)) // ensure group state exists
+	o.OnSilentTurn("qq:g:1")
+
+	o.mu.Lock()
+	st := o.groups["qq:g:1"]
+	o.mu.Unlock()
+	if st == nil || len(st.replies) != 0 {
+		t.Fatalf("silent turn must not record a reply event: %+v", st)
+	}
+}
+
 func TestPendingStaleDropped(t *testing.T) {
 	cfg := defaultConfig()
 	cfg.CooldownSec = 0
@@ -335,7 +463,7 @@ func TestPendingStaleDropped(t *testing.T) {
 	}
 }
 
-func TestPendingOnlyFirstForwardedRestWaits(t *testing.T) {
+func TestPendingMergedIntoSingleBatch(t *testing.T) {
 	cfg := defaultConfig()
 	cfg.CooldownSec = 0
 	cfg.MinIntervalSec = 0
@@ -355,18 +483,26 @@ func TestPendingOnlyFirstForwardedRestWaits(t *testing.T) {
 	busy = false
 	o.OnGroupReply("qq:g:1")
 	if len(forwarded) != 1 {
-		t.Fatalf("only the first pending should forward, got %d", len(forwarded))
+		t.Fatalf("pending should merge into one batch decision, got %d", len(forwarded))
+	}
+	if !forwarded[0].SplitReplies {
+		t.Fatal("batch decision should carry SplitReplies")
+	}
+	for _, want := range []string{"你们觉得什么好玩", "这是第二个话题"} {
+		if !strings.Contains(forwarded[0].Content, want) {
+			t.Fatalf("batch prompt missing %q", want)
+		}
 	}
 	o.mu.Lock()
 	st := o.groups["qq:g:1"]
 	remaining := len(st.pending)
 	o.mu.Unlock()
-	if remaining != 1 {
-		t.Fatalf("second pending should stay queued, remaining=%d", remaining)
+	if remaining != 0 {
+		t.Fatalf("batch should consume the whole queue, remaining=%d", remaining)
 	}
 }
 
-func TestPendingFlushPendsCurrentMessage(t *testing.T) {
+func TestNewMessageJoinsPendingBatch(t *testing.T) {
 	cfg := defaultConfig()
 	cfg.CooldownSec = 0
 	cfg.MinIntervalSec = 0
@@ -384,46 +520,213 @@ func TestPendingFlushPendsCurrentMessage(t *testing.T) {
 	if d := o.Decide(msg("qq:g:1", "A", "你们觉得什么好玩", false)); !d.Pending {
 		t.Fatalf("first message should pend while busy: %+v", d)
 	}
-	// Session frees; a new message arrives: the deferred one is forwarded and
-	// the CURRENT message must pend again (serial, one turn at a time).
+	// Session frees; a new message arrives: the whole queue merges into one
+	// batch decision returned directly, nothing stays queued.
 	busy = false
 	d := o.Decide(msg("qq:g:1", "B", "还有什么推荐", false))
-	if !d.Pending {
-		t.Fatalf("current message should pend after flushing a deferred forward: %+v", d)
+	if !d.Forward {
+		t.Fatalf("free-path batch should forward: %+v", d)
 	}
-	if len(forwarded) != 1 {
-		t.Fatalf("deferred decision should have been forwarded: %d", len(forwarded))
+	if len(forwarded) != 0 {
+		t.Fatalf("free-path decision should be returned directly, not via forwarder: %d", len(forwarded))
+	}
+	if !d.SplitReplies {
+		t.Fatal("free-path batch decision should carry SplitReplies")
+	}
+	for _, want := range []string{"你们觉得什么好玩", "还有什么推荐"} {
+		if !strings.Contains(d.Content, want) {
+			t.Fatalf("batch decision should merge old and new pending, missing %q", want)
+		}
 	}
 	o.mu.Lock()
 	st := o.groups["qq:g:1"]
 	remaining := len(st.pending)
 	o.mu.Unlock()
-	if remaining != 1 {
-		t.Fatalf("current message should be queued pending, remaining=%d", remaining)
-	}
-
-	// After the forwarded turn completes, the pending current is decided.
-	o.OnGroupReply("qq:g:1")
-	if len(forwarded) != 2 {
-		t.Fatalf("pending current should be forwarded after reply: %d", len(forwarded))
+	if remaining != 0 {
+		t.Fatalf("batch should consume the whole queue, remaining=%d", remaining)
 	}
 }
 
-func TestCatchUpCharCap(t *testing.T) {
+func TestBatchMaxMsgsCap(t *testing.T) {
 	cfg := defaultConfig()
 	cfg.CooldownSec = 0
 	cfg.MinIntervalSec = 0
 	cfg.MaxPerHour = 100
-	cfg.CatchupMaxChars = 10
+	cfg.MaxBatchMsgs = 2
+	o := New(cfg)
+	busy := true
+	o.SetSessionBusy(func(string) bool { return busy })
+	var forwarded []Decision
+	o.SetForwarder(func(_ string, d Decision) error {
+		forwarded = append(forwarded, d)
+		return nil
+	})
+
+	o.Decide(msg("qq:g:1", "A", "旧一你们怎么看", false))
+	o.Decide(msg("qq:g:1", "B", "旧二你们怎么看", false))
+	o.Decide(msg("qq:g:1", "C", "最新你们怎么看", false))
+
+	busy = false
+	o.OnGroupReply("qq:g:1")
+	if len(forwarded) != 1 {
+		t.Fatalf("expected one batch decision, got %d", len(forwarded))
+	}
+	// The over-cap message must not be a candidate, though it may appear in the
+	// background context section.
+	candStart := strings.Index(forwarded[0].Content, "【本次待处理的排队消息】")
+	candEnd := strings.Index(forwarded[0].Content, "【补充上下文")
+	if candStart < 0 || candEnd < candStart {
+		t.Fatalf("unexpected batch prompt layout: %s", previewContent(forwarded[0].Content))
+	}
+	candSection := forwarded[0].Content[candStart:candEnd]
+	if strings.Contains(candSection, "旧一") {
+		t.Fatal("messages beyond max_batch_msgs should be dropped from the candidates")
+	}
+	for _, want := range []string{"旧二", "最新"} {
+		if !strings.Contains(candSection, want) {
+			t.Fatalf("batch candidates missing %q", want)
+		}
+	}
+}
+
+func TestNonActivatingDroppedFromPendingKeptAsContext(t *testing.T) {
+	cfg := defaultConfig()
+	cfg.CooldownSec = 0
+	cfg.MinIntervalSec = 0
+	cfg.MaxPerHour = 100
 	o := newTestObserver(cfg)
 
-	o.Decide(msg("qq:g:1", "A", "M1at消息", true))
-	o.Decide(msg("qq:g:1", "B", "很长很长的闲聊内容AAAAAAAAAA", false))
-	d := o.Decide(msg("qq:g:1", "C", "你们怎么看", false))
+	// Non-keyword message: no turn, dropped from pending (buffer keeps it).
+	if d := o.Decide(msg("qq:g:1", "A", "今天天气不错", false)); d.Forward {
+		t.Fatal("non-keyword message should not forward")
+	}
+	o.mu.Lock()
+	st := o.groups["qq:g:1"]
+	pending := len(st.pending)
+	bufLen := len(st.buf)
+	o.mu.Unlock()
+	if pending != 0 {
+		t.Fatalf("non-activating message should be dropped from pending, pending=%d", pending)
+	}
+	if bufLen == 0 {
+		t.Fatal("non-activating message should stay in the rolling buffer as context")
+	}
+
+	// A later keyword batch should see it in the background context.
+	d := o.Decide(msg("qq:g:1", "B", "你们怎么看这个", false))
 	if !d.Forward {
-		t.Fatal("should forward")
+		t.Fatal("keyword message should forward as a batch")
 	}
-	if strings.Contains(d.Content, "很长很长的闲聊内容") {
-		t.Fatal("catchup text beyond char cap should be dropped")
+	if !strings.Contains(d.Content, "今天天气不错") || !strings.Contains(d.Content, "补充上下文") {
+		t.Fatalf("earlier message should appear as batch context: %+v", d.Content)
 	}
+}
+
+func TestBatchPromptCarriesSenderQQAndNoNamePrefix(t *testing.T) {
+	cfg := defaultConfig()
+	cfg.CooldownSec = 0
+	cfg.MinIntervalSec = 0
+	cfg.MaxPerHour = 100
+	o := New(cfg)
+	busy := true
+	o.SetSessionBusy(func(string) bool { return busy })
+	var forwarded []Decision
+	o.SetForwarder(func(_ string, d Decision) error {
+		forwarded = append(forwarded, d)
+		return nil
+	})
+
+	o.Decide(IncomingMessage{SessionKey: "qq:g:1", UserName: "小明", UserID: "123456", Content: "你们怎么看", Mentioned: false})
+	busy = false
+	o.OnGroupReply("qq:g:1")
+	if len(forwarded) != 1 {
+		t.Fatalf("expected one batch decision, got %d", len(forwarded))
+	}
+	for _, want := range []string{"QQ 123456", "小明", "get_msg"} {
+		if !strings.Contains(forwarded[0].Content, want) {
+			t.Fatalf("batch prompt missing %q", want)
+		}
+	}
+	for _, forbidden := range []string{"开头点出对方名字", "不要用其他分隔符", "不要列条陈词", "[CQ:at", "最多", "口语化", "简短", "config.toml", ".codex"} {
+		if strings.Contains(forwarded[0].Content, forbidden) {
+			t.Fatalf("batch prompt should not contain %q", forbidden)
+		}
+	}
+}
+
+func TestRealMessageTimeUsedForEntry(t *testing.T) {
+	o := newTestObserver(defaultConfig())
+	msgAt := time.Now().Add(-3 * time.Minute)
+	o.Decide(IncomingMessage{
+		SessionKey:        "qq:g:1",
+		UserName:          "A",
+		Content:           "你们怎么看",
+		Mentioned:         false,
+		UserMessageTimeMs: msgAt.UnixMilli(),
+	})
+
+	o.mu.Lock()
+	st := o.groups["qq:g:1"]
+	o.mu.Unlock()
+	if len(st.buf) == 0 {
+		t.Fatal("message should be observed")
+	}
+	if !st.buf[0].At.Equal(time.UnixMilli(msgAt.UnixMilli())) {
+		t.Fatalf("entry time = %v, want %v (real message time)", st.buf[0].At, msgAt)
+	}
+}
+
+func TestMediaOnlyMessageVisibleAsContextNotJudged(t *testing.T) {
+	cfg := defaultConfig()
+	cfg.CooldownSec = 0
+	cfg.MinIntervalSec = 0
+	cfg.MaxPerHour = 100
+	o := newTestObserver(cfg)
+
+	// Media-only message: observed as context, no turn triggered by itself.
+	if d := o.Decide(IncomingMessage{SessionKey: "qq:g:1", UserName: "A", MessageID: "10086", MediaKind: "图片"}); d.Forward {
+		t.Fatal("media-only message should not trigger a turn by itself")
+	}
+	// A later keyword batch includes it as context with its id and kind.
+	d := o.Decide(msg("qq:g:1", "B", "你们怎么看", false))
+	if !d.Forward {
+		t.Fatal("keyword message should forward")
+	}
+	for _, want := range []string{"图片 id 10086", "媒体消息", "不需要判断是否回复"} {
+		if !strings.Contains(d.Content, want) {
+			t.Fatalf("batch prompt missing %q", want)
+		}
+	}
+}
+
+func TestQuotedMessageIDInPrompt(t *testing.T) {
+	cfg := defaultConfig()
+	cfg.CooldownSec = 0
+	cfg.MinIntervalSec = 0
+	cfg.MaxPerHour = 100
+	o := New(cfg)
+	busy := true
+	o.SetSessionBusy(func(string) bool { return busy })
+	var forwarded []Decision
+	o.SetForwarder(func(_ string, d Decision) error {
+		forwarded = append(forwarded, d)
+		return nil
+	})
+
+	o.Decide(IncomingMessage{SessionKey: "qq:g:1", UserName: "小明", UserID: "123", Content: "这条是回复，你们怎么看", QuotedMessageID: "888"})
+	busy = false
+	o.OnGroupReply("qq:g:1")
+	if len(forwarded) != 1 {
+		t.Fatalf("expected one batch decision, got %d", len(forwarded))
+	}
+	if !strings.Contains(forwarded[0].Content, "引用 id 888") {
+		t.Fatalf("batch prompt missing quoted message id: %s", previewContent(forwarded[0].Content))
+	}
+}
+
+func previewContent(s string) string {
+	if len(s) > 200 {
+		return s[:200]
+	}
+	return s
 }
