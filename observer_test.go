@@ -10,6 +10,21 @@ func msg(session, sender, content string, mentioned bool) IncomingMessage {
 	return IncomingMessage{SessionKey: session, UserName: sender, Content: content, Mentioned: mentioned}
 }
 
+func msgAt(session, sender, content string, mentioned bool, localISO string) IncomingMessage {
+	t := mustLocal(localISO)
+	m := msg(session, sender, content, mentioned)
+	m.UserMessageTimeMs = t.UnixMilli()
+	return m
+}
+
+func mustLocal(localISO string) time.Time {
+	t, err := time.ParseInLocation("2006-01-02T15:04:05", localISO, time.FixedZone("CST", 8*3600))
+	if err != nil {
+		panic(err)
+	}
+	return t
+}
+
 func newTestObserver(cfg Config) *Observer {
 	cfg.WindowSec = 0 // tests opt into the engage window explicitly
 	return New(cfg)
@@ -263,6 +278,32 @@ func TestBatchIncludesEarlierPendingMessages(t *testing.T) {
 	}
 }
 
+func TestNonActivatingPendingRidesAlongLaterBatch(t *testing.T) {
+	cfg := defaultConfig()
+	cfg.CooldownSec = 0
+	cfg.MinIntervalSec = 0
+	cfg.MaxPerHour = 100
+	o := newTestObserver(cfg)
+
+	// M1/M2 have no activation: no turn yet, but they stay queued.
+	if d := o.Decide(msg("qq:g:1", "A", "闲聊内容甲", false)); d.Forward {
+		t.Fatal("M1 should not forward on its own")
+	}
+	if d := o.Decide(msg("qq:g:1", "B", "闲聊内容乙", false)); d.Forward {
+		t.Fatal("M2 should not forward on its own")
+	}
+	// M3 triggers via keyword: accumulated M1/M2 must ride along.
+	d3 := o.Decide(msg("qq:g:1", "C", "你们怎么看这个话题", false))
+	if !d3.Forward {
+		t.Fatal("M3 should forward")
+	}
+	for _, want := range []string{"闲聊内容甲", "闲聊内容乙", "你们怎么看这个话题"} {
+		if !strings.Contains(d3.Content, want) {
+			t.Fatalf("batch missing accumulated message %q", want)
+		}
+	}
+}
+
 func TestBatchExcludesStalePending(t *testing.T) {
 	cfg := defaultConfig()
 	cfg.CooldownSec = 0
@@ -347,6 +388,234 @@ func TestNonAtPendingWhenBusy(t *testing.T) {
 	d := o.Decide(msg("qq:g:1", "A", "你们觉得什么好玩", false))
 	if !d.Pending || d.Forward {
 		t.Fatalf("busy non-@ message should pend: %+v", d)
+	}
+}
+
+func TestAtCarriesPendingCatchupAndConsumes(t *testing.T) {
+	cfg := defaultConfig()
+	cfg.WindowSec = 600
+	cfg.CooldownSec = 0
+	cfg.MinIntervalSec = 0
+	cfg.MaxPerHour = 100
+	o := New(cfg)
+
+	// a: non-triggering message stays queued.
+	if d := o.Decide(msg("qq:g:1", "A", "闲聊背景甲", false)); d.Forward {
+		t.Fatal("a should not forward on its own")
+	}
+	// b: @ triggers a direct turn that carries a as background and marks the @.
+	d := o.Decide(msg("qq:g:1", "B", "b直接问问题", true))
+	if !d.Forward {
+		t.Fatal("b should forward")
+	}
+	if !strings.Contains(d.Content, "被 @ 的直接对话") || !strings.Contains(d.Content, "b直接问问题") {
+		t.Fatal("at trigger missing from prompt")
+	}
+	if !strings.Contains(d.Content, "上方【本次触发】那条才是被 @ 你的消息") || !strings.Contains(d.Content, "闲聊背景甲") {
+		t.Fatalf("at turn should carry cached background with explicit marking: %+v", d.Content)
+	}
+	o.mu.Lock()
+	pending := len(o.groups["qq:g:1"].pending)
+	st := o.groups["qq:g:1"]
+	for i := range st.replies {
+		st.replies[i].At = time.Now().Add(-11 * time.Minute) // 关闭 engage 窗口
+	}
+	o.mu.Unlock()
+	if pending != 0 {
+		t.Fatalf("pending should be consumed by the at turn, pending=%d", pending)
+	}
+	// c stays queued; e (keyword) rides along with c but not with the consumed a.
+	if d := o.Decide(msg("qq:g:1", "C", "闲聊背景丙", false)); d.Forward {
+		t.Fatal("c should not forward on its own")
+	}
+	d2 := o.Decide(msg("qq:g:1", "E", "你们怎么看", false))
+	if !d2.Forward || !strings.Contains(d2.Content, "闲聊背景丙") {
+		t.Fatalf("later batch should carry queued c: %+v", d2.Content)
+	}
+	if strings.Contains(d2.Content, "闲聊背景甲") {
+		t.Fatal("consumed a should not be re-carried in a later batch")
+	}
+}
+
+func TestMultiUserCooldownReusesRuleWindow(t *testing.T) {
+	cfg := defaultConfig()
+	cfg.WindowSec = 600
+	cfg.CooldownSec = 0
+	cfg.MinIntervalSec = 0
+	cfg.MaxPerHour = 100
+	cfg.Rules = []Rule{{Type: "multi_user", MinUsers: 2, WindowSec: 300}}
+	o := New(cfg)
+
+	if d := o.Decide(msg("qq:g:1", "A", "闲聊甲", false)); d.Forward {
+		t.Fatal("single sender should not trigger multi_user")
+	}
+	if d := o.Decide(msg("qq:g:1", "B", "闲聊乙", false)); !d.Forward {
+		t.Fatal("two senders should trigger multi_user")
+	}
+	// Third sender within the same window: cooldown blocks a re-trigger.
+	if d := o.Decide(msg("qq:g:1", "C", "闲聊丙", false)); d.Forward {
+		t.Fatal("multi_user should not re-trigger within its window")
+	}
+	// Simulate the window expiring: triggers again.
+	o.mu.Lock()
+	st := o.groups["qq:g:1"]
+	st.lastMultiUserAt = time.Now().Add(-301 * time.Second)
+	o.mu.Unlock()
+	if d := o.Decide(msg("qq:g:1", "D", "闲聊丁", false)); !d.Forward {
+		t.Fatal("multi_user should trigger again after its window")
+	}
+}
+
+func TestDailyBatchResetRunsOncePerGroupPerDay(t *testing.T) {
+	cfg := defaultConfig()
+	cfg.ResetHour = 4
+	cfg.ResetContextThreshold = 200000
+	o := newTestObserver(cfg)
+	var calls []string
+	o.SetSessionResetter(func(sessionKey string, maxTokens int) bool {
+		calls = append(calls, sessionKey)
+		return true
+	})
+	// 群会话先出现（消息时间在重置窗口外也可）。
+	// 播种群会话（时间任意，仅让 groups 里有记录）。
+	o.Decide(msgAt("qq:g:1", "A", "消息", false, "2026-08-09T03:00:00"))
+	o.Decide(msgAt("qq:g:2", "B", "消息", false, "2026-08-09T03:01:00"))
+
+	// 4 点窗口内批量检查：每群一次。
+	o.dailyBatchReset(mustLocal("2026-08-10T04:00:30"))
+	if len(calls) != 2 {
+		t.Fatalf("batch should check each group once, calls=%v", calls)
+	}
+	// 同一窗口再次执行：不重复。
+	o.dailyBatchReset(mustLocal("2026-08-10T04:15:00"))
+	if len(calls) != 2 {
+		t.Fatalf("batch should not re-check same day, calls=%v", calls)
+	}
+	// 非重置窗口：不执行。
+	o.dailyBatchReset(mustLocal("2026-08-10T09:00:00"))
+	if len(calls) != 2 {
+		t.Fatalf("batch should skip outside reset hour, calls=%v", calls)
+	}
+	// 第二天：再次批量检查。
+	o.dailyBatchReset(mustLocal("2026-08-11T04:00:30"))
+	if len(calls) != 4 {
+		t.Fatalf("batch should check again next day, calls=%v", calls)
+	}
+}
+
+func TestNextResetTime(t *testing.T) {
+	cfg := defaultConfig()
+	cfg.ResetHour = 4
+	o := newTestObserver(cfg)
+	if got := o.nextResetTime(mustLocal("2026-08-10T03:00:00")); !got.Equal(mustLocal("2026-08-10T04:00:00")) {
+		t.Fatalf("before 4am should target today 4am, got %v", got)
+	}
+	if got := o.nextResetTime(mustLocal("2026-08-10T04:00:00")); !got.Equal(mustLocal("2026-08-11T04:00:00")) {
+		t.Fatalf("at 4am exactly should target tomorrow, got %v", got)
+	}
+	if got := o.nextResetTime(mustLocal("2026-08-10T23:59:00")); !got.Equal(mustLocal("2026-08-11T04:00:00")) {
+		t.Fatalf("after 4am should target next day, got %v", got)
+	}
+}
+
+func TestDailyResetDisabledWithoutThreshold(t *testing.T) {
+	cfg := defaultConfig()
+	cfg.ResetHour = 4
+	cfg.ResetContextThreshold = 0 // 未启用
+	o := newTestObserver(cfg)
+	calls := 0
+	o.SetSessionResetter(func(string, int) bool { calls++; return true })
+	o.dailyBatchReset(mustLocal("2026-08-10T04:00:00"))
+	o.Start() // 未启用时 no-op，不应 panic
+	o.Close()
+	if calls != 0 {
+		t.Fatalf("threshold 0 should disable daily reset, calls=%d", calls)
+	}
+}
+
+func TestNoReplyThrottleWindowCountAndReset(t *testing.T) {
+	cfg := defaultConfig()
+	cfg.NoReplyThrottleMin = 2
+	cfg.WindowSec = 600
+	cfg.NoReplyThrottleGap = 120
+	o := New(cfg)
+	o.Decide(msg("qq:g:1", "A", "闲聊", false)) // 建立群状态
+
+	o.mu.Lock()
+	st := o.groups["qq:g:1"]
+	t0 := time.Now()
+	o.recordNoReplyLocked(st, t0)
+	o.recordNoReplyLocked(st, t0.Add(time.Minute))
+	// 计数达阈值后第一次转交放行并记录间隔。
+	if !o.noReplyThrottleAllowsLocked(st, t0.Add(90*time.Second)) {
+		t.Fatal("first throttled batch should be allowed")
+	}
+	// 间隔未满 2min：不放行。
+	if o.noReplyThrottleAllowsLocked(st, t0.Add(95*time.Second)) {
+		t.Fatal("should hold within the 2min gap")
+	}
+	// 间隔已过：放行。
+	if !o.noReplyThrottleAllowsLocked(st, t0.Add(4*time.Minute)) {
+		t.Fatal("should allow after the 2min gap")
+	}
+	// 窗口剪枝：超过 10min 的 NO_REPLY 自动出窗。
+	st.noReplyTimes = nil
+	o.recordNoReplyLocked(st, t0)
+	o.recordNoReplyLocked(st, t0.Add(30*time.Second))
+	o.pruneNoReplyLocked(st, t0.Add(11*time.Minute))
+	if len(st.noReplyTimes) != 0 {
+		t.Fatalf("window aging should drop old entries, got %d", len(st.noReplyTimes))
+	}
+	o.mu.Unlock()
+
+	// 真实回复重置计数。
+	o.mu.Lock()
+	o.recordNoReplyLocked(st, time.Now())
+	o.mu.Unlock()
+	o.OnGroupReply("qq:g:1")
+	o.mu.Lock()
+	if len(o.groups["qq:g:1"].noReplyTimes) != 0 || !o.groups["qq:g:1"].lastNoReplyTurn.IsZero() {
+		t.Fatal("real reply should reset throttle state")
+	}
+	o.mu.Unlock()
+}
+
+func TestNoReplyThrottleHoldsProactiveBatchAndKeepsPending(t *testing.T) {
+	cfg := defaultConfig()
+	cfg.NoReplyThrottleMin = 2
+	cfg.WindowSec = 600
+	cfg.NoReplyThrottleGap = 120
+	cfg.CooldownSec = 0
+	cfg.MinIntervalSec = 0
+	cfg.MaxPerHour = 100
+	o := New(cfg)
+
+	o.Decide(msg("qq:g:1", "A", "闲聊", false))
+	o.OnSilentTurn("qq:g:1")
+	o.OnSilentTurn("qq:g:1")
+
+	// 达阈值后第一条关键词消息：放行（降频批次开始计时）。
+	if d := o.Decide(msg("qq:g:1", "B", "你们怎么看这个", false)); !d.Forward {
+		t.Fatal("first batch after throttle should forward")
+	}
+	// 2min 内的第二条：hold，pending 保留。
+	if d := o.Decide(msg("qq:g:1", "C", "有没有更好的", false)); d.Forward {
+		t.Fatal("within the 2min gap the batch should be held")
+	}
+	// 模拟 2min 间隔已过：下一条消息放行，且把攒住的 C 一起带上。
+	o.mu.Lock()
+	o.groups["qq:g:1"].lastNoReplyTurn = time.Now().Add(-121 * time.Second)
+	o.mu.Unlock()
+	d := o.Decide(msg("qq:g:1", "E", "怎么操作", false))
+	if !d.Forward {
+		t.Fatal("after the gap the batch should forward")
+	}
+	if !strings.Contains(d.Content, "有没有更好的") {
+		t.Fatalf("held pending message should ride along: %.80s", d.Content)
+	}
+	// @ 高优消息不受降频影响（即便计数仍达标、间隔未到）。
+	if d := o.Decide(msg("qq:g:1", "D", "在吗", true)); !d.Forward {
+		t.Fatal("at messages must bypass the throttle")
 	}
 }
 
@@ -589,14 +858,14 @@ func TestBatchMaxMsgsCap(t *testing.T) {
 	}
 }
 
-func TestNonActivatingDroppedFromPendingKeptAsContext(t *testing.T) {
+func TestNonActivatingPendingStaysQueuedAndRidesAlong(t *testing.T) {
 	cfg := defaultConfig()
 	cfg.CooldownSec = 0
 	cfg.MinIntervalSec = 0
 	cfg.MaxPerHour = 100
 	o := newTestObserver(cfg)
 
-	// Non-keyword message: no turn, dropped from pending (buffer keeps it).
+	// Non-keyword message: no turn, but it stays queued for a later batch.
 	if d := o.Decide(msg("qq:g:1", "A", "今天天气不错", false)); d.Forward {
 		t.Fatal("non-keyword message should not forward")
 	}
@@ -605,20 +874,25 @@ func TestNonActivatingDroppedFromPendingKeptAsContext(t *testing.T) {
 	pending := len(st.pending)
 	bufLen := len(st.buf)
 	o.mu.Unlock()
-	if pending != 0 {
-		t.Fatalf("non-activating message should be dropped from pending, pending=%d", pending)
+	if pending != 1 {
+		t.Fatalf("non-activating message should stay queued, pending=%d", pending)
 	}
 	if bufLen == 0 {
 		t.Fatal("non-activating message should stay in the rolling buffer as context")
 	}
 
-	// A later keyword batch should see it in the background context.
+	// A later keyword batch should carry it as a batch candidate.
 	d := o.Decide(msg("qq:g:1", "B", "你们怎么看这个", false))
 	if !d.Forward {
 		t.Fatal("keyword message should forward as a batch")
 	}
-	if !strings.Contains(d.Content, "今天天气不错") || !strings.Contains(d.Content, "补充上下文") {
-		t.Fatalf("earlier message should appear as batch context: %+v", d.Content)
+	candStart := strings.Index(d.Content, "【本次待处理的排队消息】")
+	candEnd := strings.Index(d.Content, "【补充上下文")
+	if candEnd < 0 {
+		candEnd = len(d.Content)
+	}
+	if candStart < 0 || candEnd < candStart || !strings.Contains(d.Content[candStart:candEnd], "今天天气不错") {
+		t.Fatalf("earlier queued message should ride along as a batch candidate: %+v", d.Content)
 	}
 }
 
@@ -692,7 +966,7 @@ func TestMediaOnlyMessageVisibleAsContextNotJudged(t *testing.T) {
 	if !d.Forward {
 		t.Fatal("keyword message should forward")
 	}
-	for _, want := range []string{"图片 id 10086", "媒体消息", "不需要判断是否回复"} {
+	for _, want := range []string{"[mid=10086]", "〔图片〕", "媒体消息", "不需要判断是否回复"} {
 		if !strings.Contains(d.Content, want) {
 			t.Fatalf("batch prompt missing %q", want)
 		}

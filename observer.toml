@@ -1,5 +1,13 @@
 # 群聊被动参与插件配置（observer，cc-connect 总开关：config.toml 顶层 observer = 本文件路径）
 
+# ============ 峰谷两套大配置（2026-08-17 起 DeepSeek 峰谷定价） ============
+# 顶层 = 谷峰配置（默认生效）；[peak] = 高峰时段(北京时间 09:00-12:00 / 14:00-18:00)覆盖项。
+# 覆盖语义：int >0、string 非空、rules 非空才覆盖，未写字段沿用顶层。
+# 当前调整（按 8/13 数据决策）：
+#   - 关键词库：什么/怎么/吗/你们/？/啥/如何/有没有（删除"呢"）
+#   - 连续回话窗口：高峰 5min / 谷峰 10min
+#   - 多人聊天规则：重新启用 min_users=4，规则自带 5min 冷却（复用规则窗口，触发过一次后窗口内不重复触发）
+
 # 每群滚动观察缓冲大小（条）
 buffer_size = 50
 # 激活时最多给模型看的最近消息条数
@@ -14,8 +22,20 @@ max_per_hour = 1000
 recent_replies_for_prompt = 10
 # 回复率：只参与你认为属于前 X% 值得参与的话题（测试期可设 100）
 reply_rate = 20
-# 统一时间窗口（秒）：pending 超时即弃 / 真实回复后持续投递共用
+# 共享窗口（秒）：pending 超时即弃 + 拼历史消息(补充上下文)收集；固定 10min，
+# 不随高峰变化（高峰只收窄连续回话窗口）
 window_sec = 600
+# 连续回话窗口（秒）：真实回复后的持续投递；谷峰 10min，高峰由 [peak] 覆盖为 5min
+engage_window_sec = 600
+# 每日上下文重置：北京时间 reset_hour 后每个群首次有消息时，若该会话上下文超过
+# reset_context_threshold token，则重置为新线程（避免跨天长上下文继续烧缓存输入）
+reset_hour = 4
+reset_context_threshold = 200000
+# NO_REPLY 降频：window_sec(10min 共享窗口)内累计 2 次 NO_REPLY 后，非高优
+# (@/小鲸鱼 除外)转交降为每 120s 一批（间隔内消息继续排队，到点整批转交）；
+# 有真实回复即重置计数；计数随 window_sec 窗口自动衰减
+no_reply_throttle_min = 2
+no_reply_throttle_interval_sec = 120
 # 一次批量回合最多合并的排队消息条数（超出部分丢弃最旧的）
 max_batch_msgs = 100
 
@@ -33,9 +53,23 @@ persona_alias = "小鲸鱼"
 # 激活规则列表（v1 实现 keyword，后续可扩展 burst / multi_user / random）
 [[rules]]
 type = "keyword"
-regex = ["什么", "怎么", "吗", "呢", "你们", "？"]
+regex = ["什么", "怎么", "吗", "你们", "？", "啥", "如何", "有没有"]
 
 [[rules]]
+type = "multi_user"
+min_users = 4        # 窗口内 ≥4 个不同发言者即触发；自带 5min 冷却（复用 window_sec）
+window_sec = 300
+
+# ============ 高峰覆盖（北京时间 09:00-12:00 / 14:00-18:00） ============
+[peak]
+# 只收窄连续回话窗口 5min（window_sec/历史收集/context_chars 均沿用顶层 10min 配置）
+engage_window_sec = 300
+
+[[peak.rules]]
+type = "keyword"
+regex = ["什么", "怎么", "吗", "你们", "？", "啥", "如何", "有没有"]
+
+[[peak.rules]]
 type = "multi_user"
 min_users = 4
 window_sec = 300

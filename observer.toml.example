@@ -15,8 +15,18 @@ max_per_hour = 3
 recent_replies_for_prompt = 10
 # 回复率：只参与你认为属于前 X% 值得参与的话题（测试期可设 100）
 reply_rate = 20
-# 统一时间窗口（秒）：pending 超时即弃 / 真实回复后持续投递共用
+# 共享窗口（秒）：pending 超时即弃 + 拼历史消息(补充上下文)收集
 window_sec = 600
+# 连续回话窗口（秒）：真实回复后的持续投递；0 = 跟随 window_sec
+engage_window_sec = 0
+# 每日上下文重置检查小时（北京时间 0-23）；与阈值配合使用
+reset_hour = 4
+# 会话上下文超过该 token 数才在 reset_hour 后重置；0 = 不启用
+reset_context_threshold = 0
+# NO_REPLY 降频：窗口内累计 NO_REPLY 达该值后非高优转交降频；0 = 不启用
+no_reply_throttle_min = 0
+# 降频后两次转交最小间隔（秒）
+no_reply_throttle_interval_sec = 120
 # 一次批量回合最多合并的排队消息条数（超出部分丢弃最旧的）
 max_batch_msgs = 100
 
