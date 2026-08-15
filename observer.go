@@ -4,13 +4,13 @@
 // cc-connect hosts the codex sessions; this plugin only decides, for every
 // group message, whether it is forwarded to the agent and with what parameters
 // (prompt content, reasoning effort, progress suppression). It also keeps a
-// pending queue for non-direct messages: when a batch is worth a turn, ALL
-// queued candidates since the last processing point are merged into ONE task so
-// the agent judges in a single pass which of them are worth replying to
-// (instead of one forwarding decision per message), and each reply is delivered
-// as its own group message. The rolling buffer supplies surrounding context for
-// the batch; non-activating candidates are dropped from the queue (they stay in
-// the buffer as context).
+// pending queue for normal turns (非 @/昵称消息): when a batch is worth a turn,
+// ALL queued candidates since the last processing point are merged into ONE
+// task so the agent judges in a single pass which of them are worth replying
+// to (instead of one forwarding decision per message), and each reply is
+// delivered as its own group message. The rolling buffer supplies surrounding
+// context for the batch; candidates that did not justify a turn stay queued
+// for a later batch (the buffer keeps them as context in the meantime).
 package observer
 
 import (
@@ -39,14 +39,14 @@ type Config struct {
 	EngageWindowSec        int             `toml:"engage_window_sec"`              // 连续回话窗口（真实回复后的持续投递）；0 = 跟随 window_sec
 	ResetHour              int             `toml:"reset_hour"`                     // 每天定时重置的检查小时（北京时间 0-23）
 	ResetContextThreshold  int             `toml:"reset_context_threshold"`        // 会话上下文超过该 token 数才在 reset_hour 后重置；0 = 不启用
-	NoReplyThrottleMin     int             `toml:"no_reply_throttle_min"`          // 窗口内累计 NO_REPLY 数达该值后非高优转交降频；0 = 不启用
+	NoReplyThrottleMin     int             `toml:"no_reply_throttle_min"`          // 窗口内累计 NO_REPLY 数达该值后普通回合转交降频；0 = 不启用
 	NoReplyThrottleGap     int             `toml:"no_reply_throttle_interval_sec"` // 降频后两次转交最小间隔（秒）
-	AtEffort               string          `toml:"at_effort"`                      // reasoning effort for direct turns (@ / nickname), default "medium"
-	ProactiveEffort        string          `toml:"proactive_effort"`               // reasoning effort for proactive turns (default "low")
+	AtEffort               string          `toml:"at_effort"`                      // 高优回合（@/昵称）的推理强度，默认 "medium"
+	ProactiveEffort        string          `toml:"proactive_effort"`               // 普通回合（非 @/昵称）的推理强度，默认 "low"
 	SuppressGroupProgress  bool            `toml:"suppress_group_progress"`        // hide thinking/progress for all group turns
 	PersonaName            string          `toml:"persona_name"`                   // persona display name; empty uses a generic label
 	PersonaAlias           string          `toml:"persona_alias"`                  // alias/nickname; mentioned in the persona when set
-	MaxBatchMsgs           int             `toml:"max_batch_msgs"`                 // max queued messages merged into one batch turn
+	MaxBatchMsgs           int             `toml:"max_batch_msgs"`                 // 普通回合一次最多合并的排队消息条数
 	Rules                  []Rule          `toml:"rules"`
 	Peak                   PeriodOverrides `toml:"peak"` // 高峰时段(北京时间 9-12/14-18)覆盖项；0/空表示沿用谷峰配置
 }
@@ -152,6 +152,7 @@ type Decision struct {
 	Effort           string // reasoning effort override for this turn
 	SuppressProgress bool   // hide thinking/tool progress for this turn
 	SplitReplies     bool   // final response may carry several "---"-separated replies, each sent separately
+	Direct           bool   // 路由判定：true = 高优回合（@/昵称，平台直通）；false = 普通回合（注入合成消息）
 }
 
 // ObservedMessage is one buffered group message (text plus identity metadata).
@@ -169,14 +170,14 @@ type ObservedMessage struct {
 // used for per-session frequency control and prompt annotations.
 type replyEvent struct {
 	At   time.Time
-	Kind string // "proactive" (real proactive reply) | "at" (@-directed) | "alias" (nickname-directed)
+	Kind string // "proactive"（普通回合真实回复）| "at"（@ 高优回合）| "alias"（昵称高优回合）
 }
 
 type groupState struct {
 	chatName        string
 	buf             []ObservedMessage
 	replies         []replyEvent
-	pending         []pendingMsg // non-direct candidates awaiting a batch turn
+	pending         []pendingMsg // 普通回合候选（非 @/昵称）
 	lastAct         time.Time
 	lastMultiUserAt time.Time   // 多人规则最近一次触发时刻（冷却用，复用规则自身的窗口）
 	lastForwardedAt time.Time   // newest message actually forwarded to the agent
@@ -185,7 +186,7 @@ type groupState struct {
 	lastNoReplyTurn time.Time   // 降频期间最近一次实际转交批次的时间（2min 间隔用）
 }
 
-// pendingMsg is a proactive candidate deferred until the running turn completes.
+// pendingMsg is a normal-turn candidate deferred until the running turn completes.
 type pendingMsg struct {
 	msg   IncomingMessage
 	entry ObservedMessage
@@ -282,7 +283,7 @@ func (o *Observer) SetIgnorePatterns(patterns []string) {
 }
 
 // SetSessionBusy registers the host's in-flight-turn check. When a turn is
-// running, non-@ proactive decisions are deferred until it completes.
+// running, normal-turn decisions are deferred until it completes.
 func (o *Observer) SetSessionBusy(fn func(sessionKey string) bool) {
 	o.busy = fn
 }
@@ -394,9 +395,9 @@ func (o *Observer) dailyBatchReset(now time.Time) {
 
 // Decide is the group-message forwarding policy: it records the message,
 // updates the forwarding point, and decides whether/how to forward it.
-// @-bot messages and explicit nickname mentions are direct conversations and
-// always forward with at_effort; other messages are forwarded as proactive
-// turns when the activation rules hit.
+// @-bot messages and explicit nickname mentions are high-priority turns
+// (高优回合) and always forward with at_effort; other messages are forwarded as
+// normal turns (普通回合) when the activation rules hit.
 func (o *Observer) Decide(msg IncomingMessage) Decision {
 	if strings.TrimSpace(msg.Content) == "" && msg.MediaKind == "" {
 		return Decision{}
@@ -445,18 +446,17 @@ func (o *Observer) Decide(msg IncomingMessage) Decision {
 		pruneReplies(st)
 		st.lastForwardedAt = entry.At
 		catchup := o.catchupBeforeLocked(st)
-		st.pending = nil // 未转交的缓存随本次直接对话一并转交，避免后续重复打包
+		st.pending = nil // 未转交的缓存随本次高优回合一并转交，避免后续重复打包
 		prompt := o.buildTurnPrompt(st, entry, catchup, kind)
 		o.mu.Unlock()
 		slog.Info("observer: decision", "session", msg.SessionKey, "direct", true, "outcome", "forward")
-		return Decision{Forward: true, Content: prompt, Effort: effortOr(o.cfg.AtEffort, "medium"), SuppressProgress: o.cfg.SuppressGroupProgress}
+		return Decision{Forward: true, Content: prompt, Effort: effortOr(o.cfg.AtEffort, "medium"), SuppressProgress: o.cfg.SuppressGroupProgress, SplitReplies: true, Direct: true}
 	}
 
-	// Non-direct candidate: always enters the pending queue first, then the
-	// queue is processed. Busy -> the entry waits for the next busy-cycle;
-	// free -> "enqueue == dequeue" (processed immediately). Non-activating
-	// entries stay queued so they can ride along with a later batch. Direct
-	// messages are decided immediately and rely on cc-connect's own queueing.
+	// 普通回合候选：总是先入 pending 队列，再处理队列。Busy -> 等下一轮；
+	// free -> "入队即出队"（立即处理）。未触发激活的条目继续留在队列，
+	// 可随后续普通回合并一并评估。高优回合（@/昵称）立即决策，
+	// 依赖 cc-connect 自身的队列机制。
 	st.pending = append(st.pending, pendingMsg{msg: msg, entry: entry})
 	if len(st.pending) > maxPending {
 		st.pending = st.pending[len(st.pending)-maxPending:]
@@ -539,7 +539,7 @@ func (o *Observer) pruneNoReplyLocked(st *groupState, now time.Time) {
 	st.noReplyTimes = keep
 }
 
-// noReplyThrottleAllowsLocked 判定本次非高优批量转交是否放行：
+// noReplyThrottleAllowsLocked 判定本次普通回合转交是否放行：
 // 窗口内 NO_REPLY 数未达阈值 -> 正常放行；
 // 达阈值进入降频 -> 距上次实际转交批次不足 interval 则先不放行（pending 继续攒，
 // 直到后续消息发现自己未被频控时整批转交），间隔已过则放行并记录本次批次时间。
@@ -563,7 +563,7 @@ func (o *Observer) noReplyThrottleAllowsLocked(st *groupState, now time.Time) bo
 	return false
 }
 
-// redecidePending re-evaluates deferred proactive candidates now that a turn
+// redecidePending re-evaluates deferred normal-turn candidates now that a turn
 // has completed. If the session is busy again (another turn started), they
 // keep waiting.
 func (o *Observer) redecidePending(sessionKey string) {
@@ -631,7 +631,7 @@ func (o *Observer) processPendingLocked(st *groupState) (decisions []Decision, r
 
 // batchActivateLocked decides whether the pending batch deserves one AI turn.
 // Cooldown / min-interval / max-per-hour guards apply to the batch as a whole
-// (one batch = one potential proactive turn); then either the engage window is
+// (one batch = one potential normal turn); then either the engage window is
 // open or at least one candidate matches an activation rule. The caller must
 // hold o.mu.
 func (o *Observer) batchActivateLocked(st *groupState, batch []pendingMsg) bool {
@@ -674,99 +674,110 @@ func (o *Observer) isStale(at time.Time) bool {
 	return w > 0 && time.Since(at) > w
 }
 
-// buildTurnPrompt assembles the prompt for a turn: persona, the triggering
-// message, supplemented skipped context, recent reply records and the
-// participation rules. kind is "at" (@-directed, eager reply), "alias"
-// (nickname mentioned; judge whether it is really directed at the bot),
-// "engage" (message inside the engage window after a recent reply; the model
-// judges from message time and text whether it is directed at the bot), or ""
-// (ambient turn; top-X% worth-replying judgment).
+// buildTurnPrompt assembles the prompt for a high-priority turn (高优回合,
+// @-directed or nickname-called): persona, the latest message (the actual
+// trigger), the supplementary recent dialogue (others' messages plus the
+// bot's own recent replies) and the requirements for this turn. kind is "at"
+// (@ 高优，积极回复) or "alias" (昵称高优；判断是否真的直接跟机器人说话).
+// The "engage"/"" branches are kept for completeness but are not reachable
+// from Decide today.
 func (o *Observer) buildTurnPrompt(st *groupState, trigger ObservedMessage, catchup []ObservedMessage, kind string) string {
 	var sb strings.Builder
 	o.writePersona(&sb)
 
-	sb.WriteString("\n【本次触发】\n\n")
+	// 要求段放在消息之前：同场景回合的身份+要求前缀完全一致，可提升前缀缓存命中率。
+	sb.WriteString("\n【本次要求】\n")
 	switch kind {
 	case "at":
-		sb.WriteString("- 这条消息是被 @ 的直接对话：应当积极回应，一般都要回复；\n")
+		sb.WriteString("- 这条消息是被 @ 的直接对话：应当积极回应、一般都要回复，除非实在无话可说，否则不要输出 NO_REPLY；\n")
 	case "alias":
 		fmt.Fprintf(&sb, "- 本条提到了你的昵称：先结合上下文判断是否真的是直接跟你说话；是 → 积极回应；否（只是提到/转述等）→ 按“最值得回复”自我评价，只参与最值得回复的前 %d%% 的话题（不硬凑、不勉强）；\n", replyRate(o.cfg))
-	case "engage":
-		fmt.Fprintf(&sb, "- 依据消息时间与文本判断是否在与自己对话；是 → 积极回应；否 → 只参与最值得回复的前 %d%% 的话题（不硬凑、不勉强）；\n", replyRate(o.cfg))
-	default:
-		fmt.Fprintf(&sb, "- 这条消息没有被 @ 也没有叫你：按“最值得回复”自我评价，只参与最值得回复的前 %d%% 的话题（不硬凑、不勉强）；\n", replyRate(o.cfg))
-	}
-	sb.WriteString(describeTrigger(trigger))
-	if len(catchup) > 0 {
-		sb.WriteString("\n【补充上下文（此前未转交的最近消息）】\n")
-		if kind == "at" {
-			sb.WriteString("- 上方【本次触发】那条才是被 @ 你的消息，以下仅为此前的群消息背景；\n")
-		} else if kind == "alias" {
-			sb.WriteString("- 上方【本次触发】那条是提到你昵称的消息，以下仅为此前的群消息背景；\n")
-		}
-		for i, m := range catchup {
-			sb.WriteString(describeObserved(i+1, m))
-		}
-	}
-
-	sb.WriteString("\n你近期的发言/触发记录（注意频控，避免高频刷屏）：\n")
-	sb.WriteString(o.recentRepliesText(st))
-
-	sb.WriteString("\n回复要求：\n- 口语化、简短（一般 1-2 句），不要列条陈词、不要像客服；\n")
-	switch kind {
-	case "at":
-		sb.WriteString("- 这是直接对话：请积极回应、一般都要回复，除非实在无话可说，否则不要输出 NO_REPLY；\n")
-	case "alias":
 		sb.WriteString("- 判断为直接对话时不要输出 NO_REPLY；判断为并非直接对话时，不值得参与就输出 NO_REPLY；\n")
 	case "engage":
+		fmt.Fprintf(&sb, "- 依据消息时间与文本判断是否在与自己对话；是 → 积极回应；否 → 按“最值得回复”自我评价，只参与最值得回复的前 %d%% 的话题（不硬凑、不勉强）；\n", replyRate(o.cfg))
 		sb.WriteString("- 判断为在跟你对话（追问/接话/点名）时不要输出 NO_REPLY；判断并非对你所说时，不值得参与就输出 NO_REPLY；\n")
 	default:
+		fmt.Fprintf(&sb, "- 这条消息没有被 @ 也没有叫你：按“最值得回复”自我评价，只参与最值得回复的前 %d%% 的话题（不硬凑、不勉强）；\n", replyRate(o.cfg))
 		sb.WriteString("- 不值得参与时只输出 NO_REPLY，不要发任何其他内容；\n")
 	}
-	sb.WriteString(`- 参与时直接输出要发到群里的内容，不要加前缀或引用标记；
-- 思考过程不要写进回复，只输出最终结论；
-- 遵守 RULES_SAFE 群聊安全规则，不暴露任何本机路径、配置、IP 等隐私信息。
-`)
-	sb.WriteString("- 如确需理解引用/图片/文件消息的原文，可用 OneBot v11 get_msg 协议按消息 id 查询（方法与边界见 RULES_QQ_REPLY.md；非必要不要查）；\n")
+	o.writeCommonReplyRules(&sb)
+
+	sb.WriteString("\n【最新消息】\n\n")
+	sb.WriteString(describeTrigger(trigger))
+
+	o.writeSupplementContext(&sb, st, catchup)
 	return sb.String()
 }
 
-// buildBatchPrompt assembles the prompt for a merged pending-batch turn: the
-// persona, all queued candidate messages (with time/sender), recent reply
-// records and the batch participation rules. kind is "engage" (inside the
-// engage window; judge first whether each message is directed at the bot) or
-// "" (ambient batch; reply only to the top-worth candidates).
+// buildBatchPrompt assembles the prompt for a normal turn (普通回合):
+// persona, the requirements, a clearly marked candidate section (排队候选，
+// 需要判断是否回复) and a separate supplementary recent-dialogue block
+// (背景他人对话 + 你的近期回复). The two are deliberately unequal in status:
+// candidates are the messages to judge, the others are background only.
+// kind is "engage" (inside the engage window; judge first whether each message
+// is directed at the bot) or "" (ambient batch; reply only to the top-worth
+// candidates).
 func (o *Observer) buildBatchPrompt(st *groupState, batch []pendingMsg, kind string) string {
 	var sb strings.Builder
 	o.writePersona(&sb)
 
-	fmt.Fprintf(&sb, "\n【本次待处理的排队消息】\n\n")
-	fmt.Fprintf(&sb, "以下是此前排队、尚未处理的 %d 条群消息（按时间顺序），需要你判断是否回复：\n", len(batch))
+	sb.WriteString("\n【本次要求】\n")
+	sb.WriteString("- 需要你判断这些消息是否值得回复，选择性回复；\n")
+	sb.WriteString("- 媒体消息（图片/语音/文件）不需要判断是否回复，仅作上下文；\n")
+	if kind == "engage" {
+		fmt.Fprintf(&sb, "- 先依据消息时间与文本判断是否在与自己对话；是 → 积极回应；否则按“最值得回复”自我评价，只参与最值得回复的前 %d%% 的话题（不硬凑、不勉强）；\n", replyRate(o.cfg))
+	} else {
+		fmt.Fprintf(&sb, "- 按“最值得回复”自我评价，只参与最值得回复的前 %d%% 的话题（不硬凑、不勉强）；\n", replyRate(o.cfg))
+	}
+	o.writeCommonReplyRules(&sb)
+	sb.WriteString("- 没有值得回复的就只输出 NO_REPLY，不要发任何其他内容。\n")
+
+	sb.WriteString("\n【待处理消息】\n\n")
+	fmt.Fprintf(&sb, "以下是此前排队、尚未处理的 %d 条群消息（按时间顺序）：\n", len(batch))
 	for i, p := range batch {
 		sb.WriteString(describeObserved(i+1, p.entry))
 	}
 
-	if ctx := o.batchContextLocked(st, batch); len(ctx) > 0 {
-		sb.WriteString("\n【补充上下文（此前未转交的最近消息，仅作背景，不必回复）】\n")
-		for i, m := range ctx {
-			sb.WriteString(describeObserved(i+1, m))
-		}
-	}
-
-	sb.WriteString("\n你近期的发言/触发记录（注意频控，避免高频刷屏）：\n")
-	sb.WriteString(o.recentRepliesText(st))
-
-	sb.WriteString("\n回复要求：\n")
-	sb.WriteString("- 判断哪些排队消息值得回复，选择性回复；\n")
-	sb.WriteString("- 媒体消息（图片/语音/文件）不需要判断是否回复，仅作上下文；\n")
-	sb.WriteString("- 如确需理解引用/图片/文件消息的原文，可用 OneBot v11 get_msg 协议按消息 id 查询（方法与边界见 RULES_QQ_REPLY.md；非必要不要查）；\n")
-	if kind == "engage" {
-		sb.WriteString("- 先依据消息时间与文本判断是否在与自己对话；是 → 积极回应；否则按值得度挑选；\n")
-	}
-	sb.WriteString("- 每条回复单独发一条群消息，回复多条时用单独一行 --- 分隔；\n")
-	sb.WriteString("- 没有值得回复的就只输出 NO_REPLY。\n")
-	sb.WriteString("- 遵守 RULES_SAFE 群聊安全规则，不暴露任何本机路径、配置、IP 等隐私信息。\n")
+	o.writeSupplementContext(&sb, st, o.batchContextLocked(st, batch))
 	return sb.String()
+}
+
+// writeSupplementContext writes the supplementary recent-conversation block:
+// other people's recent dialogue and the bot's own recent replies as parallel
+// sub-lists, so the model can tell that all of it is background context.
+// Either half appears only when there is content.
+func (o *Observer) writeSupplementContext(sb *strings.Builder, st *groupState, others []ObservedMessage) {
+	var ob strings.Builder
+	for i, m := range others {
+		ob.WriteString(describeObserved(i+1, m))
+	}
+	replies := o.recentRepliesText(st)
+	if ob.Len() == 0 && replies == "（无记录）\n" {
+		return
+	}
+	sb.WriteString("\n【补充近期对话】\n")
+	if ob.Len() > 0 {
+		sb.WriteString("\n他人对话：\n")
+		sb.WriteString(ob.String())
+	}
+	if replies != "（无记录）\n" {
+		sb.WriteString("\n你的近期回复（注意频控，避免高频刷屏）：\n")
+		sb.WriteString(replies)
+	}
+}
+
+// writeCommonReplyRules writes the reply rules shared by every turn type
+// (direct @/nickname turns and proactive batch turns). Keeping them in one
+// place prevents rule drift between prompt variants: previously the
+// "思考过程不要写进回复" guard only existed in the direct-turn prompt, so
+// proactive batch turns could leak their decision rationale before "---".
+func (o *Observer) writeCommonReplyRules(sb *strings.Builder) {
+	sb.WriteString(`- 口语化，不要列条陈词、不要像客服；
+- 思考过程不要写进回复，只输出最终结论；
+- 回复不同的人或不同主体时，用单独一行 --- 分隔，每条分别作为独立消息发出；
+- 如确需理解引用/图片/文件消息的原文，可用 OneBot v11 get_msg 协议按消息 id 查询（方法与边界见 RULES_QQ_REPLY.md；非必要不要查）；
+- 遵守 RULES_SAFE 群聊安全规则，不暴露任何本机路径、配置、IP 等隐私信息。
+`)
 }
 
 // batchContextLocked returns recent buffer messages around the batch as
@@ -839,7 +850,7 @@ func qqSuffix(uid string) string {
 
 // describeObserved renders one observed message with its own message id,
 // quoted id and media marker, e.g.:
-//  01. [mid=1755060018] 16:03 群绣娘（QQ 645871543）：text〔引用 id 604510697〕〔图片〕
+//  01. [mid=<消息id>] 16:03 群昵称（QQ <号码>）：text〔引用 id <被引用消息id>〕〔图片〕
 func describeObserved(idx int, m ObservedMessage) string {
 	mid := ""
 	if m.MessageID != "" {
@@ -850,8 +861,8 @@ func describeObserved(idx int, m ObservedMessage) string {
 		m.Text, quotedSuffix(m.QuotedMessageID), mediaSuffix(m.MediaKind))
 }
 
-// describeTrigger renders the triggering message of a direct turn with the
-// same id/quote/media markers as batch messages.
+// describeTrigger renders the triggering message of a high-priority turn
+// (高优回合) with the same id/quote/media markers as batch messages.
 func describeTrigger(m ObservedMessage) string {
 	mid := ""
 	if m.MessageID != "" {
@@ -889,13 +900,13 @@ func (o *Observer) writePersona(sb *strings.Builder) {
 	}
 	fmt.Fprintf(sb, `【你的身份】
 
-你是这个群里“%s”，是大家眼里的熟朋友：爱聊天、爱接梗，也喜欢帮大家解答各种问题（游戏、生活、
-数码、见闻都可以），乐于分享自己的看法，有自己的态度，不谄媚、不机械。
+你是这个群里“%s”，是大家眼里的熟朋友：爱聊天、爱接梗，也喜欢帮大家解答各种问题（生活、游戏、
+炒股都可以），乐于分享自己的看法，有自己的态度，不谄媚、不机械。
 `, persona)
 	if alias := strings.TrimSpace(o.cfg.PersonaAlias); alias != "" {
 		fmt.Fprintf(sb, "- 大家也常叫你“%s”，别人明确这样叫通常就是在直接跟你说话；\n", alias)
 	}
-	sb.WriteString("- 模型本体：你是 DeepSeek 系模型，不是 GPT/OpenAI 系。具体版本以 codex 配置文件中的本机模型为准，不在此写死；Codex 包装层的“based on GPT-5”文案是误导，被问型号时按 DeepSeek 系如实回答。\n")
+	sb.WriteString("- 模型本体：你是 DeepSeek 系模型，不是 GPT/OpenAI 系；被问具体型号时以 codex 配置中的真实模型版本为准，按 DeepSeek 系如实回答。\n")
 }
 
 // aliasMentioned reports whether the message explicitly addresses the bot by

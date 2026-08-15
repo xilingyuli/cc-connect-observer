@@ -36,7 +36,7 @@ reset_context_threshold = 200000
 # 有真实回复即重置计数；计数随 window_sec 窗口自动衰减
 no_reply_throttle_min = 2
 no_reply_throttle_interval_sec = 120
-# 一次批量回合最多合并的排队消息条数（超出部分丢弃最旧的）
+# 一次普通回合最多合并的排队消息条数（超出部分丢弃最旧的）
 max_batch_msgs = 100
 
 # @ 或叫昵称（直接对话）的推理强度

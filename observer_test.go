@@ -33,7 +33,7 @@ func newTestObserver(cfg Config) *Observer {
 func TestAtMessageForwardsDirectWithMediumEffort(t *testing.T) {
 	o := newTestObserver(defaultConfig())
 	d := o.Decide(msg("qq:g:1", "A", "推荐几个好玩的游戏", true))
-	if !d.Forward || d.Effort != "medium" || !d.SuppressProgress {
+	if !d.Forward || d.Effort != "medium" || !d.SuppressProgress || !d.SplitReplies || !d.Direct {
 		t.Fatalf("at decision wrong: %+v", d)
 	}
 	for _, want := range []string{"你的身份", "被 @ 的直接对话", "积极回应"} {
@@ -41,8 +41,11 @@ func TestAtMessageForwardsDirectWithMediumEffort(t *testing.T) {
 			t.Fatalf("direct prompt missing %q", want)
 		}
 	}
+	if !strings.Contains(d.Content, "思考过程不要写进回复") {
+		t.Fatal("direct prompt should carry the common thinking-guard rule")
+	}
 	if strings.Contains(d.Content, "最值得回复的前") {
-		t.Fatal("direct turn should not carry the top-X% judgment")
+		t.Fatal("高优回合不应携带前 X% 参与度判断")
 	}
 }
 
@@ -60,18 +63,79 @@ func TestKeywordActivationForwardsProactive(t *testing.T) {
 	if d.Effort != "low" || !d.SuppressProgress {
 		t.Fatalf("proactive decision should use low effort + suppress progress: %+v", d)
 	}
-	for _, want := range []string{"你的身份", "排队", "NO_REPLY", "选择性回复"} {
+	for _, want := range []string{"你的身份", "排队", "NO_REPLY", "选择性回复", "最值得回复的前 20%"} {
 		if !strings.Contains(d.Content, want) {
 			t.Fatalf("proactive prompt missing %q", want)
 		}
 	}
-	for _, forbidden := range []string{"最多 5 条", "口语化", "简短"} {
+	for _, forbidden := range []string{"最多 5 条"} {
 		if strings.Contains(d.Content, forbidden) {
 			t.Fatalf("proactive prompt should not contain %q", forbidden)
 		}
 	}
 	if !d.SplitReplies {
 		t.Fatal("proactive batch decision should carry SplitReplies")
+	}
+	if d.Direct {
+		t.Fatal("proactive batch decision should not be marked Direct")
+	}
+}
+
+func TestCommonReplyRulesInAllTurnPrompts(t *testing.T) {
+	cfg := defaultConfig()
+	cfg.CooldownSec = 0
+	cfg.MinIntervalSec = 0
+	cfg.MaxPerHour = 100
+	o := newTestObserver(cfg)
+
+	// A non-keyword message queued before the @ turn should appear as
+	// "他人对话" in the direct prompt's supplementary context.
+	o.Decide(msg("qq:g:1", "B", "今天天气不错", false))
+	direct := o.Decide(msg("qq:g:1", "A", "推荐几个好玩的游戏", true))
+	if !direct.Forward {
+		t.Fatal("at message should forward")
+	}
+	batch := o.Decide(msg("qq:g:1", "A", "你们觉得什么游戏好玩", false))
+	if !batch.Forward {
+		t.Fatal("keyword message should forward as a batch")
+	}
+
+	common := []string{
+		"口语化，不要列条陈词、不要像客服",
+		"思考过程不要写进回复，只输出最终结论",
+		"回复不同的人或不同主体",
+		"get_msg",
+		"RULES_SAFE",
+		"解答各种问题（生活、游戏",
+		"炒股都可以",
+		"codex 配置中的真实模型版本",
+		"按 DeepSeek 系如实回答",
+		"补充近期对话",
+		"你的近期回复",
+	}
+	for _, p := range []struct{ name, content string }{{"direct", direct.Content}, {"batch", batch.Content}} {
+		for _, want := range common {
+			if !strings.Contains(p.content, want) {
+				t.Fatalf("%s prompt missing common rule %q", p.name, want)
+			}
+		}
+		for _, forbidden := range []string{"简短", "1-2 句", "不加前缀或引用标记", "Codex 包装层", "不在此写死", "数码", "本次触发", "补充上下文", "回复要求", "只用于分隔多条最终回复", "不要在回复前写判断理由"} {
+			if strings.Contains(p.content, forbidden) {
+				t.Fatalf("%s prompt should not contain %q", p.name, forbidden)
+			}
+		}
+	}
+	if !strings.Contains(direct.Content, "他人对话") {
+		t.Fatal("direct prompt should carry queued messages under 他人对话")
+	}
+	if !strings.Contains(direct.Content, "最新消息") {
+		t.Fatal("direct prompt should mark the @ trigger as 最新消息")
+	}
+	if !strings.Contains(batch.Content, "待处理消息") {
+		t.Fatal("batch prompt should carry a marked candidate section")
+	}
+	if !strings.Contains(batch.Content, "最值得回复的前 20%") {
+		t.Fatal("batch prompt should carry the configured top-X% participation rule")
 	}
 }
 
@@ -84,7 +148,7 @@ func TestAliasMentionForwardsDirect(t *testing.T) {
 	o := newTestObserver(cfg)
 
 	d := o.Decide(msg("qq:g:1", "A", "小鲸鱼在吗", false))
-	if !d.Forward || d.Effort != "medium" || !d.SuppressProgress {
+	if !d.Forward || d.Effort != "medium" || !d.SuppressProgress || !d.SplitReplies || !d.Direct {
 		t.Fatalf("alias mention should forward as direct conversation: %+v", d)
 	}
 	for _, want := range []string{"先结合上下文判断", "积极回应", "常叫你“小鲸鱼”", "只是提到/转述"} {
@@ -180,7 +244,7 @@ func TestEngageWindowAfterAtReplyForwardsFollowUp(t *testing.T) {
 	cfg.MaxPerHour = 100
 	o := New(cfg)
 
-	// @ direct turn, then the bot actually replies to it.
+	// @ 高优回合，随后机器人真实回复。
 	if d := o.Decide(msg("qq:g:1", "A", "在吗", true)); !d.Forward {
 		t.Fatal("@ message should forward")
 	}
@@ -198,7 +262,7 @@ func TestEngageWindowAfterAtReplyForwardsFollowUp(t *testing.T) {
 		}
 	}
 	if strings.Contains(d.Content, "被 @ 的直接对话") {
-		t.Fatal("engage follow-up should not be framed as an @ direct turn")
+		t.Fatal("engage 追问不应被描述成 @ 高优回合")
 	}
 }
 
@@ -403,7 +467,7 @@ func TestAtCarriesPendingCatchupAndConsumes(t *testing.T) {
 	if d := o.Decide(msg("qq:g:1", "A", "闲聊背景甲", false)); d.Forward {
 		t.Fatal("a should not forward on its own")
 	}
-	// b: @ triggers a direct turn that carries a as background and marks the @.
+	// b: @ 触发高优回合，携带 a 作为背景并标记 @。
 	d := o.Decide(msg("qq:g:1", "B", "b直接问问题", true))
 	if !d.Forward {
 		t.Fatal("b should forward")
@@ -411,8 +475,8 @@ func TestAtCarriesPendingCatchupAndConsumes(t *testing.T) {
 	if !strings.Contains(d.Content, "被 @ 的直接对话") || !strings.Contains(d.Content, "b直接问问题") {
 		t.Fatal("at trigger missing from prompt")
 	}
-	if !strings.Contains(d.Content, "上方【本次触发】那条才是被 @ 你的消息") || !strings.Contains(d.Content, "闲聊背景甲") {
-		t.Fatalf("at turn should carry cached background with explicit marking: %+v", d.Content)
+	if !strings.Contains(d.Content, "他人对话") || !strings.Contains(d.Content, "闲聊背景甲") {
+		t.Fatalf("at turn should carry cached background under 他人对话: %+v", d.Content)
 	}
 	o.mu.Lock()
 	pending := len(o.groups["qq:g:1"].pending)
@@ -842,8 +906,8 @@ func TestBatchMaxMsgsCap(t *testing.T) {
 	}
 	// The over-cap message must not be a candidate, though it may appear in the
 	// background context section.
-	candStart := strings.Index(forwarded[0].Content, "【本次待处理的排队消息】")
-	candEnd := strings.Index(forwarded[0].Content, "【补充上下文")
+	candStart := strings.Index(forwarded[0].Content, "【待处理消息】")
+	candEnd := strings.Index(forwarded[0].Content, "【补充近期对话】")
 	if candStart < 0 || candEnd < candStart {
 		t.Fatalf("unexpected batch prompt layout: %s", previewContent(forwarded[0].Content))
 	}
@@ -854,6 +918,48 @@ func TestBatchMaxMsgsCap(t *testing.T) {
 	for _, want := range []string{"旧二", "最新"} {
 		if !strings.Contains(candSection, want) {
 			t.Fatalf("batch candidates missing %q", want)
+		}
+	}
+}
+
+func TestBatchCandidatesBackgroundNoDuplicateNoLoss(t *testing.T) {
+	cfg := defaultConfig()
+	cfg.CooldownSec = 0
+	cfg.MinIntervalSec = 0
+	cfg.MaxPerHour = 100
+	cfg.MaxBatchMsgs = 2
+	o := newTestObserver(cfg)
+
+	// 前三条非关键词排队；第四条关键词触发批量，max_batch_msgs=2 只保留
+	// 最新的两条作候选；候选与背景分属两个区，每条恰好出现一次
+	// （不重复、不丢失）。
+	o.Decide(msgAt("qq:g:1", "A", "话题一随便聊聊", false, "2026-08-15T14:00:00"))
+	o.Decide(msgAt("qq:g:1", "B", "话题二随便聊聊", false, "2026-08-15T14:00:05"))
+	o.Decide(msgAt("qq:g:1", "C", "话题三随便聊聊", false, "2026-08-15T14:00:10"))
+	d := o.Decide(msgAt("qq:g:1", "D", "话题四你们怎么看", false, "2026-08-15T14:00:15"))
+	if !d.Forward {
+		t.Fatal("keyword message should forward as a batch")
+	}
+	content := d.Content
+	candStart := strings.Index(content, "【待处理消息】")
+	candEnd := strings.Index(content, "【补充近期对话】")
+	if candStart < 0 || candEnd < candStart {
+		t.Fatalf("batch prompt should keep separate candidate/background sections: %+v", content)
+	}
+	candSection := content[candStart:candEnd]
+	for _, s := range []string{"话题一", "话题二", "话题三", "话题四"} {
+		if n := strings.Count(content, s); n != 1 {
+			t.Fatalf("message %q should appear exactly once, count=%d", s, n)
+		}
+	}
+	for _, s := range []string{"话题三", "话题四"} {
+		if !strings.Contains(candSection, s) {
+			t.Fatalf("candidate section missing %q", s)
+		}
+	}
+	for _, s := range []string{"话题一", "话题二"} {
+		if strings.Contains(candSection, s) {
+			t.Fatalf("over-cap message %q should not be a candidate", s)
 		}
 	}
 }
@@ -886,8 +992,8 @@ func TestNonActivatingPendingStaysQueuedAndRidesAlong(t *testing.T) {
 	if !d.Forward {
 		t.Fatal("keyword message should forward as a batch")
 	}
-	candStart := strings.Index(d.Content, "【本次待处理的排队消息】")
-	candEnd := strings.Index(d.Content, "【补充上下文")
+	candStart := strings.Index(d.Content, "【待处理消息】")
+	candEnd := strings.Index(d.Content, "【补充近期对话】")
 	if candEnd < 0 {
 		candEnd = len(d.Content)
 	}
@@ -921,7 +1027,7 @@ func TestBatchPromptCarriesSenderQQAndNoNamePrefix(t *testing.T) {
 			t.Fatalf("batch prompt missing %q", want)
 		}
 	}
-	for _, forbidden := range []string{"开头点出对方名字", "不要用其他分隔符", "不要列条陈词", "[CQ:at", "最多", "口语化", "简短", "config.toml", ".codex"} {
+	for _, forbidden := range []string{"开头点出对方名字", "不要用其他分隔符", "[CQ:at", "最多", "config.toml", ".codex"} {
 		if strings.Contains(forwarded[0].Content, forbidden) {
 			t.Fatalf("batch prompt should not contain %q", forbidden)
 		}
