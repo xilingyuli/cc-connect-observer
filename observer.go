@@ -773,6 +773,7 @@ func (o *Observer) writeSupplementContext(sb *strings.Builder, st *groupState, o
 // proactive batch turns could leak their decision rationale before "---".
 func (o *Observer) writeCommonReplyRules(sb *strings.Builder) {
 	sb.WriteString(`- 口语化，不要列条陈词、不要像客服；
+- 不涉及分析时简短回复，常规分析类回复应控制在300字内（除非在该限制下不足以阐述完整重点/对方再次追问/对方要求更详细展开的情况可破例）；
 - 思考过程不要写进回复，只输出最终结论；
 - 回复不同的人或不同主体时，用单独一行 --- 分隔，每条分别作为独立消息发出；
 - 如确需理解引用/图片/文件消息的原文，可用 OneBot v11 get_msg 协议按消息 id 查询（方法与边界见 RULES_QQ_REPLY.md；非必要不要查）；
