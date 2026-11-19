@@ -1,6 +1,8 @@
 package observer
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -27,7 +29,72 @@ func mustLocal(localISO string) time.Time {
 
 func newTestObserver(cfg Config) *Observer {
 	cfg.WindowSec = 0 // tests opt into the engage window explicitly
+	cfg = withTestPrompts(cfg)
 	return New(cfg)
+}
+
+func newTestObserverWithWindow(cfg Config) *Observer {
+	cfg = withTestPrompts(cfg)
+	return New(cfg)
+}
+
+func withTestPrompts(cfg Config) Config {
+	prompts, err := loadGroupPrompts("group_chat.json")
+	if err != nil {
+		panic(err)
+	}
+	cfg.GroupPrompts = prompts
+	return cfg
+}
+
+func TestLoadConfigLoadsGroupPromptMapRelativeToConfig(t *testing.T) {
+	dir := t.TempDir()
+	promptData, err := os.ReadFile("group_chat.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "group_chat.json"), promptData, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	configPath := filepath.Join(dir, "observer.toml")
+	if err := os.WriteFile(configPath, []byte(`group_prompt_file = "group_chat.json"`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := LoadConfig(configPath)
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	if got := cfg.GroupPrompts[promptBlockRequirementsAt]; !strings.Contains(got, "被 @ 的直接对话") {
+		t.Fatalf("prompt map not loaded: %q", got)
+	}
+}
+
+func TestLoadGroupPromptsRejectsMissingRequiredKey(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "group_chat.json")
+	if err := os.WriteFile(path, []byte(`{}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := loadGroupPrompts(path); err == nil || !strings.Contains(err.Error(), "missing required key") {
+		t.Fatalf("expected missing key error, got %v", err)
+	}
+}
+
+func TestPromptPlaceholderReplacementIsWeak(t *testing.T) {
+	cfg := defaultConfig()
+	o := newTestObserver(cfg)
+
+	got := renderPromptTemplate("{{persona_name}} {{persona_alias}} {{unknown}}", map[string]string{
+		"persona_name":  "小鲸鱼",
+		"persona_alias": "",
+		"unknown":       "不应替换",
+	})
+	if got != "小鲸鱼 {{persona_alias}} {{unknown}}" {
+		t.Fatalf("weak replacement result = %q", got)
+	}
+	if got := o.prompt(promptBlockIdentity); !strings.Contains(got, "{{persona_name}}") || !strings.Contains(got, "{{persona_alias}}") {
+		t.Fatalf("empty configured names should remain as placeholders: %q", got)
+	}
 }
 
 func TestAtMessageForwardsDirectWithMediumEffort(t *testing.T) {
@@ -119,7 +186,7 @@ func TestCommonReplyRulesInAllTurnPrompts(t *testing.T) {
 				t.Fatalf("%s prompt missing common rule %q", p.name, want)
 			}
 		}
-		for _, forbidden := range []string{"简短", "1-2 句", "不加前缀或引用标记", "Codex 包装层", "不在此写死", "数码", "本次触发", "补充上下文", "回复要求", "只用于分隔多条最终回复", "不要在回复前写判断理由"} {
+		for _, forbidden := range []string{"1-2 句", "不加前缀或引用标记", "Codex 包装层", "不在此写死", "数码", "本次触发", "补充上下文", "回复要求", "只用于分隔多条最终回复", "不要在回复前写判断理由"} {
 			if strings.Contains(p.content, forbidden) {
 				t.Fatalf("%s prompt should not contain %q", p.name, forbidden)
 			}
@@ -136,6 +203,25 @@ func TestCommonReplyRulesInAllTurnPrompts(t *testing.T) {
 	}
 	if !strings.Contains(batch.Content, "最值得回复的前 20%") {
 		t.Fatal("batch prompt should carry the configured top-X% participation rule")
+	}
+}
+
+func TestExtraRulesAppendAfterCommonRules(t *testing.T) {
+	cfg := defaultConfig()
+	cfg.CooldownSec = 0
+	cfg.MinIntervalSec = 0
+	cfg.MaxPerHour = 100
+	o := newTestObserver(cfg)
+	o.cfg.GroupPrompts[promptBlockExtraRules] = "- EXTRA-RULE\n"
+
+	d := o.Decide(msg("qq:g:1", "A", "在吗", true))
+	if !d.Forward {
+		t.Fatal("at message should forward")
+	}
+	commonAt := strings.Index(d.Content, "口语化，不要列条陈词")
+	extraAt := strings.Index(d.Content, "EXTRA-RULE")
+	if commonAt < 0 || extraAt < commonAt {
+		t.Fatalf("extra rules should follow common rules: %+v", d.Content)
 	}
 }
 
@@ -228,7 +314,7 @@ func TestEngageWindowForwardsWithoutKeyword(t *testing.T) {
 	cfg.CooldownSec = 0
 	cfg.MinIntervalSec = 0
 	cfg.MaxPerHour = 100
-	o := New(cfg)
+	o := newTestObserverWithWindow(cfg)
 	o.OnGroupReply("qq:g:1")
 
 	if d := o.Decide(msg("qq:g:1", "A", "今天天气不错", false)); !d.Forward {
@@ -242,7 +328,7 @@ func TestEngageWindowAfterAtReplyForwardsFollowUp(t *testing.T) {
 	cfg.CooldownSec = 0
 	cfg.MinIntervalSec = 0
 	cfg.MaxPerHour = 100
-	o := New(cfg)
+	o := newTestObserverWithWindow(cfg)
 
 	// @ 高优回合，随后机器人真实回复。
 	if d := o.Decide(msg("qq:g:1", "A", "在吗", true)); !d.Forward {
@@ -273,7 +359,7 @@ func TestEngageWindowAfterAliasReplyForwardsFollowUp(t *testing.T) {
 	cfg.MinIntervalSec = 0
 	cfg.MaxPerHour = 100
 	cfg.PersonaAlias = "小鲸鱼"
-	o := New(cfg)
+	o := newTestObserverWithWindow(cfg)
 
 	if d := o.Decide(msg("qq:g:1", "A", "小鲸鱼在吗", false)); !d.Forward {
 		t.Fatal("alias mention should forward")
@@ -295,7 +381,7 @@ func TestEngageWindowExpiresWithoutKeyword(t *testing.T) {
 	cfg.CooldownSec = 0
 	cfg.MinIntervalSec = 0
 	cfg.MaxPerHour = 100
-	o := New(cfg)
+	o := newTestObserverWithWindow(cfg)
 
 	o.mu.Lock()
 	st := &groupState{}
@@ -374,7 +460,7 @@ func TestBatchExcludesStalePending(t *testing.T) {
 	cfg.MinIntervalSec = 0
 	cfg.MaxPerHour = 100
 	cfg.WindowSec = 600
-	o := New(cfg)
+	o := newTestObserverWithWindow(cfg)
 	busy := true
 	o.SetSessionBusy(func(string) bool { return busy })
 	var forwarded []Decision
@@ -416,7 +502,7 @@ func TestOnGroupReplyRecordsProactive(t *testing.T) {
 	cfg.CooldownSec = 0
 	cfg.MinIntervalSec = 0
 	cfg.MaxPerHour = 100
-	o := New(cfg)
+	o := newTestObserverWithWindow(cfg)
 
 	// A reply before any observation is ignored; after one Decide the group exists.
 	o.Decide(msg("qq:g:1", "A", "为什么", false))
@@ -446,7 +532,7 @@ func TestNonAtPendingWhenBusy(t *testing.T) {
 	cfg.CooldownSec = 0
 	cfg.MinIntervalSec = 0
 	cfg.MaxPerHour = 100
-	o := New(cfg)
+	o := newTestObserverWithWindow(cfg)
 	o.SetSessionBusy(func(string) bool { return true })
 
 	d := o.Decide(msg("qq:g:1", "A", "你们觉得什么好玩", false))
@@ -461,7 +547,7 @@ func TestAtCarriesPendingCatchupAndConsumes(t *testing.T) {
 	cfg.CooldownSec = 0
 	cfg.MinIntervalSec = 0
 	cfg.MaxPerHour = 100
-	o := New(cfg)
+	o := newTestObserverWithWindow(cfg)
 
 	// a: non-triggering message stays queued.
 	if d := o.Decide(msg("qq:g:1", "A", "闲聊背景甲", false)); d.Forward {
@@ -508,7 +594,7 @@ func TestMultiUserCooldownReusesRuleWindow(t *testing.T) {
 	cfg.MinIntervalSec = 0
 	cfg.MaxPerHour = 100
 	cfg.Rules = []Rule{{Type: "multi_user", MinUsers: 2, WindowSec: 300}}
-	o := New(cfg)
+	o := newTestObserverWithWindow(cfg)
 
 	if d := o.Decide(msg("qq:g:1", "A", "闲聊甲", false)); d.Forward {
 		t.Fatal("single sender should not trigger multi_user")
@@ -602,7 +688,7 @@ func TestNoReplyThrottleWindowCountAndReset(t *testing.T) {
 	cfg.NoReplyThrottleMin = 2
 	cfg.WindowSec = 600
 	cfg.NoReplyThrottleGap = 120
-	o := New(cfg)
+	o := newTestObserverWithWindow(cfg)
 	o.Decide(msg("qq:g:1", "A", "闲聊", false)) // 建立群状态
 
 	o.mu.Lock()
@@ -652,7 +738,7 @@ func TestNoReplyThrottleHoldsProactiveBatchAndKeepsPending(t *testing.T) {
 	cfg.CooldownSec = 0
 	cfg.MinIntervalSec = 0
 	cfg.MaxPerHour = 100
-	o := New(cfg)
+	o := newTestObserverWithWindow(cfg)
 
 	o.Decide(msg("qq:g:1", "A", "闲聊", false))
 	o.OnSilentTurn("qq:g:1")
@@ -685,7 +771,7 @@ func TestNoReplyThrottleHoldsProactiveBatchAndKeepsPending(t *testing.T) {
 
 func TestAtNotPendingWhenBusy(t *testing.T) {
 	cfg := defaultConfig()
-	o := New(cfg)
+	o := newTestObserverWithWindow(cfg)
 	o.SetSessionBusy(func(string) bool { return true })
 
 	d := o.Decide(msg("qq:g:1", "A", "推荐个游戏", true))
@@ -699,7 +785,7 @@ func TestPendingDecidedAfterReply(t *testing.T) {
 	cfg.CooldownSec = 0
 	cfg.MinIntervalSec = 0
 	cfg.MaxPerHour = 100
-	o := New(cfg)
+	o := newTestObserverWithWindow(cfg)
 	busy := true
 	o.SetSessionBusy(func(string) bool { return busy })
 	var forwarded []Decision
@@ -725,7 +811,7 @@ func TestPendingDecidedAfterSilentTurn(t *testing.T) {
 	cfg.CooldownSec = 0
 	cfg.MinIntervalSec = 0
 	cfg.MaxPerHour = 100
-	o := New(cfg)
+	o := newTestObserverWithWindow(cfg)
 	busy := true
 	o.SetSessionBusy(func(string) bool { return busy })
 	var forwarded []Decision
@@ -771,7 +857,7 @@ func TestPendingStaleDropped(t *testing.T) {
 	cfg.MinIntervalSec = 0
 	cfg.MaxPerHour = 100
 	cfg.WindowSec = 600
-	o := New(cfg)
+	o := newTestObserverWithWindow(cfg)
 	busy := true
 	o.SetSessionBusy(func(string) bool { return busy })
 	var forwarded []Decision
@@ -801,7 +887,7 @@ func TestPendingMergedIntoSingleBatch(t *testing.T) {
 	cfg.CooldownSec = 0
 	cfg.MinIntervalSec = 0
 	cfg.MaxPerHour = 100
-	o := New(cfg)
+	o := newTestObserverWithWindow(cfg)
 	busy := true
 	o.SetSessionBusy(func(string) bool { return busy })
 	var forwarded []Decision
@@ -840,7 +926,7 @@ func TestNewMessageJoinsPendingBatch(t *testing.T) {
 	cfg.CooldownSec = 0
 	cfg.MinIntervalSec = 0
 	cfg.MaxPerHour = 100
-	o := New(cfg)
+	o := newTestObserverWithWindow(cfg)
 	busy := true
 	o.SetSessionBusy(func(string) bool { return busy })
 	var forwarded []Decision
@@ -886,7 +972,7 @@ func TestBatchMaxMsgsCap(t *testing.T) {
 	cfg.MinIntervalSec = 0
 	cfg.MaxPerHour = 100
 	cfg.MaxBatchMsgs = 2
-	o := New(cfg)
+	o := newTestObserverWithWindow(cfg)
 	busy := true
 	o.SetSessionBusy(func(string) bool { return busy })
 	var forwarded []Decision
@@ -1007,7 +1093,7 @@ func TestBatchPromptCarriesSenderQQAndNoNamePrefix(t *testing.T) {
 	cfg.CooldownSec = 0
 	cfg.MinIntervalSec = 0
 	cfg.MaxPerHour = 100
-	o := New(cfg)
+	o := newTestObserverWithWindow(cfg)
 	busy := true
 	o.SetSessionBusy(func(string) bool { return busy })
 	var forwarded []Decision
@@ -1084,7 +1170,7 @@ func TestQuotedMessageIDInPrompt(t *testing.T) {
 	cfg.CooldownSec = 0
 	cfg.MinIntervalSec = 0
 	cfg.MaxPerHour = 100
-	o := New(cfg)
+	o := newTestObserverWithWindow(cfg)
 	busy := true
 	o.SetSessionBusy(func(string) bool { return busy })
 	var forwarded []Decision

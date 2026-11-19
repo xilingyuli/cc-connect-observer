@@ -14,10 +14,13 @@
 package observer
 
 import (
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -28,27 +31,29 @@ import (
 // Config is the observer's own configuration (separate TOML file beside the
 // cc-connect config; the path is set via the host's observer setting).
 type Config struct {
-	BufferSize             int             `toml:"buffer_size"`
-	MaxContextMsgs         int             `toml:"max_context_msgs"`
-	CooldownSec            int             `toml:"cooldown_sec"`
-	MinIntervalSec         int             `toml:"min_interval_sec"`
-	MaxPerHour             int             `toml:"max_per_hour"`
-	RecentRepliesForPrompt int             `toml:"recent_replies_for_prompt"`
-	ReplyRate              int             `toml:"reply_rate"`                     // 0-100: participate only in the top X% of topics worth joining
-	WindowSec              int             `toml:"window_sec"`                     // 共享窗口：pending 超时即弃 + 拼历史消息(补充上下文)收集
-	EngageWindowSec        int             `toml:"engage_window_sec"`              // 连续回话窗口（真实回复后的持续投递）；0 = 跟随 window_sec
-	ResetHour              int             `toml:"reset_hour"`                     // 每天定时重置的检查小时（北京时间 0-23）
-	ResetContextThreshold  int             `toml:"reset_context_threshold"`        // 会话上下文超过该 token 数才在 reset_hour 后重置；0 = 不启用
-	NoReplyThrottleMin     int             `toml:"no_reply_throttle_min"`          // 窗口内累计 NO_REPLY 数达该值后普通回合转交降频；0 = 不启用
-	NoReplyThrottleGap     int             `toml:"no_reply_throttle_interval_sec"` // 降频后两次转交最小间隔（秒）
-	AtEffort               string          `toml:"at_effort"`                      // 高优回合（@/昵称）的推理强度，默认 "medium"
-	ProactiveEffort        string          `toml:"proactive_effort"`               // 普通回合（非 @/昵称）的推理强度，默认 "low"
-	SuppressGroupProgress  bool            `toml:"suppress_group_progress"`        // hide thinking/progress for all group turns
-	PersonaName            string          `toml:"persona_name"`                   // persona display name; empty uses a generic label
-	PersonaAlias           string          `toml:"persona_alias"`                  // alias/nickname; mentioned in the persona when set
-	MaxBatchMsgs           int             `toml:"max_batch_msgs"`                 // 普通回合一次最多合并的排队消息条数
-	Rules                  []Rule          `toml:"rules"`
-	Peak                   PeriodOverrides `toml:"peak"` // 高峰时段(北京时间 9-12/14-18)覆盖项；0/空表示沿用谷峰配置
+	BufferSize             int               `toml:"buffer_size"`
+	MaxContextMsgs         int               `toml:"max_context_msgs"`
+	CooldownSec            int               `toml:"cooldown_sec"`
+	MinIntervalSec         int               `toml:"min_interval_sec"`
+	MaxPerHour             int               `toml:"max_per_hour"`
+	RecentRepliesForPrompt int               `toml:"recent_replies_for_prompt"`
+	ReplyRate              int               `toml:"reply_rate"`                     // 0-100: participate only in the top X% of topics worth joining
+	WindowSec              int               `toml:"window_sec"`                     // 共享窗口：pending 超时即弃 + 拼历史消息(补充上下文)收集
+	EngageWindowSec        int               `toml:"engage_window_sec"`              // 连续回话窗口（真实回复后的持续投递）；0 = 跟随 window_sec
+	ResetHour              int               `toml:"reset_hour"`                     // 每天定时重置的检查小时（北京时间 0-23）
+	ResetContextThreshold  int               `toml:"reset_context_threshold"`        // 会话上下文超过该 token 数才在 reset_hour 后重置；0 = 不启用
+	NoReplyThrottleMin     int               `toml:"no_reply_throttle_min"`          // 窗口内累计 NO_REPLY 数达该值后普通回合转交降频；0 = 不启用
+	NoReplyThrottleGap     int               `toml:"no_reply_throttle_interval_sec"` // 降频后两次转交最小间隔（秒）
+	AtEffort               string            `toml:"at_effort"`                      // 高优回合（@/昵称）的推理强度，默认 "medium"
+	ProactiveEffort        string            `toml:"proactive_effort"`               // 普通回合（非 @/昵称）的推理强度，默认 "low"
+	SuppressGroupProgress  bool              `toml:"suppress_group_progress"`        // hide thinking/progress for all group turns
+	PersonaName            string            `toml:"persona_name"`                   // persona display name; empty uses a generic label
+	PersonaAlias           string            `toml:"persona_alias"`                  // alias/nickname; mentioned in the persona when set
+	MaxBatchMsgs           int               `toml:"max_batch_msgs"`                 // 普通回合一次最多合并的排队消息条数
+	GroupPromptFile        string            `toml:"group_prompt_file"`              // 外部提示词 keymap；相对路径按 observer.toml 所在目录解析
+	GroupPrompts           map[string]string `toml:"-"`                              // 启动时装入，运行期只读
+	Rules                  []Rule            `toml:"rules"`
+	Peak                   PeriodOverrides   `toml:"peak"` // 高峰时段(北京时间 9-12/14-18)覆盖项；0/空表示沿用谷峰配置
 }
 
 // Rule is one activation rule. v1 implements type "keyword"; the rule list is
@@ -195,6 +200,34 @@ type pendingMsg struct {
 const maxReplyEvents = 30
 const maxPending = 500 // storage cap for the pending queue (most recent kept)
 
+const (
+	promptBlockIdentity          = "group.block.identity"
+	promptBlockRequirementsAt    = "group.block.requirements.at"
+	promptBlockRequirementsAlias = "group.block.requirements.alias"
+	promptBlockBatchEngage       = "group.block.requirements.batch.engage"
+	promptBlockBatchAmbient      = "group.block.requirements.batch.ambient"
+	promptBlockCommonRules       = "group.block.requirements.common"
+	promptBlockExtraRules        = "group.block.requirements.extra"
+	promptBlockBatchNoReply      = "group.block.requirements.no_reply"
+)
+
+var requiredGroupPromptKeys = []string{
+	promptBlockIdentity,
+	promptBlockRequirementsAt,
+	promptBlockRequirementsAlias,
+	promptBlockBatchEngage,
+	promptBlockBatchAmbient,
+	promptBlockCommonRules,
+	promptBlockExtraRules,
+	promptBlockBatchNoReply,
+}
+
+var promptPlaceholderWhitelist = map[string]struct{}{
+	"persona_name":  {},
+	"persona_alias": {},
+	"reply_rate":    {},
+}
+
 var beijingZone = time.FixedZone("CST", 8*3600)
 
 // Observer is the decision layer (one per engine/project).
@@ -232,6 +265,7 @@ func defaultConfig() Config {
 		ProactiveEffort:        "low",
 		SuppressGroupProgress:  true,
 		MaxBatchMsgs:           100,
+		GroupPromptFile:        "group_chat.json",
 		Rules: []Rule{{
 			Type:  "keyword",
 			Regex: []string{"什么", "怎么", "吗", "你们", "？", "啥", "如何", "有没有"},
@@ -259,12 +293,59 @@ func LoadConfig(path string) (Config, error) {
 	if err := toml.Unmarshal(data, &cfg); err != nil {
 		return cfg, err
 	}
+	promptPath := strings.TrimSpace(cfg.GroupPromptFile)
+	if promptPath == "" {
+		return cfg, fmt.Errorf("observer: group_prompt_file is required")
+	}
+	if !filepath.IsAbs(promptPath) {
+		promptPath = filepath.Join(filepath.Dir(path), promptPath)
+	}
+	prompts, err := loadGroupPrompts(promptPath)
+	if err != nil {
+		return cfg, err
+	}
+	cfg.GroupPrompts = prompts
 	return cfg, nil
 }
 
 // New creates an observer.
 func New(cfg Config) *Observer {
 	return &Observer{cfg: cfg, groups: map[string]*groupState{}}
+}
+
+func loadGroupPrompts(path string) (map[string]string, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("observer: read group prompts %q: %w", path, err)
+	}
+	var prompts map[string]string
+	if err := json.Unmarshal(data, &prompts); err != nil {
+		return nil, fmt.Errorf("observer: parse group prompts %q: %w", path, err)
+	}
+	for _, key := range requiredGroupPromptKeys {
+		if _, ok := prompts[key]; !ok {
+			return nil, fmt.Errorf("observer: group prompts %q missing required key %q", path, key)
+		}
+	}
+	return prompts, nil
+}
+
+func renderPromptTemplate(template string, vars map[string]string) string {
+	if len(vars) == 0 || !strings.Contains(template, "{{") {
+		return template
+	}
+	pairs := make([]string, 0, len(vars)*2)
+	for key := range promptPlaceholderWhitelist {
+		value := vars[key]
+		if value == "" {
+			continue
+		}
+		pairs = append(pairs, "{{"+key+"}}", value)
+	}
+	if len(pairs) == 0 {
+		return template
+	}
+	return strings.NewReplacer(pairs...).Replace(template)
 }
 
 // SetIgnorePatterns sets regexes that exclude messages from observation
@@ -674,32 +755,37 @@ func (o *Observer) isStale(at time.Time) bool {
 	return w > 0 && time.Since(at) > w
 }
 
+func (o *Observer) prompt(key string) string {
+	return renderPromptTemplate(o.cfg.GroupPrompts[key], o.promptVars())
+}
+
+func (o *Observer) promptVars() map[string]string {
+	return map[string]string{
+		"persona_name":  strings.TrimSpace(o.cfg.PersonaName),
+		"persona_alias": strings.TrimSpace(o.cfg.PersonaAlias),
+		"reply_rate":    strconv.Itoa(replyRate(o.cfg)),
+	}
+}
+
+func (o *Observer) writePrompt(sb *strings.Builder, key string) {
+	sb.WriteString(o.prompt(key))
+}
+
 // buildTurnPrompt assembles the prompt for a high-priority turn (高优回合,
 // @-directed or nickname-called): persona, the latest message (the actual
 // trigger), the supplementary recent dialogue (others' messages plus the
 // bot's own recent replies) and the requirements for this turn. kind is "at"
 // (@ 高优，积极回复) or "alias" (昵称高优；判断是否真的直接跟机器人说话).
-// The "engage"/"" branches are kept for completeness but are not reachable
-// from Decide today.
 func (o *Observer) buildTurnPrompt(st *groupState, trigger ObservedMessage, catchup []ObservedMessage, kind string) string {
 	var sb strings.Builder
 	o.writePersona(&sb)
 
 	// 要求段放在消息之前：同场景回合的身份+要求前缀完全一致，可提升前缀缓存命中率。
-	sb.WriteString("\n【本次要求】\n")
-	switch kind {
-	case "at":
-		sb.WriteString("- 这条消息是被 @ 的直接对话：应当积极回应、一般都要回复，除非实在无话可说，否则不要输出 NO_REPLY；\n")
-	case "alias":
-		fmt.Fprintf(&sb, "- 本条提到了你的昵称：先结合上下文判断是否真的是直接跟你说话；是 → 积极回应；否（只是提到/转述等）→ 按“最值得回复”自我评价，只参与最值得回复的前 %d%% 的话题（不硬凑、不勉强）；\n", replyRate(o.cfg))
-		sb.WriteString("- 判断为直接对话时不要输出 NO_REPLY；判断为并非直接对话时，不值得参与就输出 NO_REPLY；\n")
-	case "engage":
-		fmt.Fprintf(&sb, "- 依据消息时间与文本判断是否在与自己对话；是 → 积极回应；否 → 按“最值得回复”自我评价，只参与最值得回复的前 %d%% 的话题（不硬凑、不勉强）；\n", replyRate(o.cfg))
-		sb.WriteString("- 判断为在跟你对话（追问/接话/点名）时不要输出 NO_REPLY；判断并非对你所说时，不值得参与就输出 NO_REPLY；\n")
-	default:
-		fmt.Fprintf(&sb, "- 这条消息没有被 @ 也没有叫你：按“最值得回复”自我评价，只参与最值得回复的前 %d%% 的话题（不硬凑、不勉强）；\n", replyRate(o.cfg))
-		sb.WriteString("- 不值得参与时只输出 NO_REPLY，不要发任何其他内容；\n")
+	requirementKey := promptBlockRequirementsAlias
+	if kind == "at" {
+		requirementKey = promptBlockRequirementsAt
 	}
+	o.writePrompt(&sb, requirementKey)
 	o.writeCommonReplyRules(&sb)
 
 	sb.WriteString("\n【最新消息】\n\n")
@@ -721,16 +807,13 @@ func (o *Observer) buildBatchPrompt(st *groupState, batch []pendingMsg, kind str
 	var sb strings.Builder
 	o.writePersona(&sb)
 
-	sb.WriteString("\n【本次要求】\n")
-	sb.WriteString("- 需要你判断这些消息是否值得回复，选择性回复；\n")
-	sb.WriteString("- 媒体消息（图片/语音/文件）不需要判断是否回复，仅作上下文；\n")
 	if kind == "engage" {
-		fmt.Fprintf(&sb, "- 先依据消息时间与文本判断是否在与自己对话；是 → 积极回应；否则按“最值得回复”自我评价，只参与最值得回复的前 %d%% 的话题（不硬凑、不勉强）；\n", replyRate(o.cfg))
+		o.writePrompt(&sb, promptBlockBatchEngage)
 	} else {
-		fmt.Fprintf(&sb, "- 按“最值得回复”自我评价，只参与最值得回复的前 %d%% 的话题（不硬凑、不勉强）；\n", replyRate(o.cfg))
+		o.writePrompt(&sb, promptBlockBatchAmbient)
 	}
 	o.writeCommonReplyRules(&sb)
-	sb.WriteString("- 没有值得回复的就只输出 NO_REPLY，不要发任何其他内容。\n")
+	o.writePrompt(&sb, promptBlockBatchNoReply)
 
 	sb.WriteString("\n【待处理消息】\n\n")
 	fmt.Fprintf(&sb, "以下是此前排队、尚未处理的 %d 条群消息（按时间顺序）：\n", len(batch))
@@ -752,7 +835,7 @@ func (o *Observer) writeSupplementContext(sb *strings.Builder, st *groupState, o
 		ob.WriteString(describeObserved(i+1, m))
 	}
 	replies := o.recentRepliesText(st)
-	if ob.Len() == 0 && replies == "（无记录）\n" {
+	if ob.Len() == 0 && replies == "" {
 		return
 	}
 	sb.WriteString("\n【补充近期对话】\n")
@@ -760,7 +843,7 @@ func (o *Observer) writeSupplementContext(sb *strings.Builder, st *groupState, o
 		sb.WriteString("\n他人对话：\n")
 		sb.WriteString(ob.String())
 	}
-	if replies != "（无记录）\n" {
+	if replies != "" {
 		sb.WriteString("\n你的近期回复（注意频控，避免高频刷屏）：\n")
 		sb.WriteString(replies)
 	}
@@ -772,13 +855,8 @@ func (o *Observer) writeSupplementContext(sb *strings.Builder, st *groupState, o
 // "思考过程不要写进回复" guard only existed in the direct-turn prompt, so
 // proactive batch turns could leak their decision rationale before "---".
 func (o *Observer) writeCommonReplyRules(sb *strings.Builder) {
-	sb.WriteString(`- 口语化，不要列条陈词、不要像客服；
-- 不涉及分析时简短回复，常规分析类回复应控制在300字内（除非在该限制下不足以阐述完整重点/对方再次追问/对方要求更详细展开的情况可破例）；
-- 思考过程不要写进回复，只输出最终结论；
-- 回复不同的人或不同主体时，用单独一行 --- 分隔，每条分别作为独立消息发出；
-- 如确需理解引用/图片/文件消息的原文，可用 OneBot v11 get_msg 协议按消息 id 查询（方法与边界见 RULES_QQ_REPLY.md；非必要不要查）；
-- 遵守 RULES_SAFE 群聊安全规则，不暴露任何本机路径、配置、IP 等隐私信息。
-`)
+	o.writePrompt(sb, promptBlockCommonRules)
+	o.writePrompt(sb, promptBlockExtraRules)
 }
 
 // batchContextLocked returns recent buffer messages around the batch as
@@ -895,19 +973,7 @@ func mediaSuffix(kind string) string {
 
 // writePersona writes the persona block shared by all turn prompts.
 func (o *Observer) writePersona(sb *strings.Builder) {
-	persona := o.cfg.PersonaName
-	if strings.TrimSpace(persona) == "" {
-		persona = "本群机器人"
-	}
-	fmt.Fprintf(sb, `【你的身份】
-
-你是这个群里“%s”，是大家眼里的熟朋友：爱聊天、爱接梗，也喜欢帮大家解答各种问题（生活、游戏、
-炒股都可以），乐于分享自己的看法，有自己的态度，不谄媚、不机械。
-`, persona)
-	if alias := strings.TrimSpace(o.cfg.PersonaAlias); alias != "" {
-		fmt.Fprintf(sb, "- 大家也常叫你“%s”，别人明确这样叫通常就是在直接跟你说话；\n", alias)
-	}
-	sb.WriteString("- 模型本体：你是 DeepSeek 系模型，不是 GPT/OpenAI 系；被问具体型号时以 codex 配置中的真实模型版本为准，按 DeepSeek 系如实回答。\n")
+	o.writePrompt(sb, promptBlockIdentity)
 }
 
 // aliasMentioned reports whether the message explicitly addresses the bot by
@@ -925,7 +991,7 @@ func (o *Observer) recentRepliesText(st *groupState) string {
 		replies = replies[len(replies)-n:]
 	}
 	if len(replies) == 0 {
-		return "（无记录）\n"
+		return ""
 	}
 	var sb strings.Builder
 	for _, r := range replies {

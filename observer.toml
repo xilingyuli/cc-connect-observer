@@ -1,5 +1,9 @@
 # 群聊被动参与插件配置（observer，cc-connect 总开关：config.toml 顶层 observer = 本文件路径）
 
+# 群聊固定提示词 keymap；相对路径按本文件所在目录解析。
+# 修改 JSON 后执行 cc-connect 的 /restart 即可重新装入内存，无需重编。
+group_prompt_file = "group_chat.json"
+
 # ============ 峰谷两套大配置（2026-08-17 起 DeepSeek 峰谷定价） ============
 # 顶层 = 谷峰配置（默认生效）；[peak] = 高峰时段(北京时间 09:00-12:00 / 14:00-18:00)覆盖项。
 # 覆盖语义：int >0、string 非空、rules 非空才覆盖，未写字段沿用顶层。

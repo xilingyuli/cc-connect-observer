@@ -1,6 +1,9 @@
 # 群聊被动参与插件配置（部署位置：<data_dir>/observer.toml，如 ~/.cc-connect/observer.toml）
 # 总开关在 cc-connect 的 config.toml 顶层：observer = 本文件路径
 
+# 群聊固定提示词 keymap；相对路径按本文件所在目录解析
+group_prompt_file = "group_chat.json"
+
 # 每群滚动观察缓冲大小（条）
 buffer_size = 50
 # 激活时最多给模型看的最近消息条数

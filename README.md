@@ -52,3 +52,17 @@ observer = "/abs/path/to/observer.toml"
 关键项：`at_effort` / `proactive_effort` / `suppress_group_progress`、
 `window_sec`（pending 超时 / 持续投递共用）、`max_batch_msgs`、
 `reply_rate`、`[[rules]]`。
+
+## 群聊提示词
+
+固定提示词维护在同目录的 `group_chat.json`，由 `observer.toml` 的
+`group_prompt_file` 指定；相对路径按 `observer.toml` 所在目录解析。启动时将
+keymap 装入内存，运行期每个群回合只查内存，不重复读取文件。
+
+身份、at/alias/普通批次要求、公共规则 `common` 和定制规则 `extra` 通过 key
+读取；消息块标题、消息行格式、`reply_rate`、昵称、消息数量、发送者、时间、
+消息 id 以及最近回复记录由代码动态拼接。修改 `group_chat.json` 后执行
+cc-connect 的 `/restart` 即可重新加载，无需重新编译。
+
+占位符只替换白名单内的 `persona_name`、`persona_alias`、`reply_rate`；值为空或
+占位符不在白名单时原样保留，不报错。替换仅作用于 keymap 模板，不扫描消息正文。
